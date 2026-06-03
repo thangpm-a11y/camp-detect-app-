@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DetectLab — Slot Preview</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #0b1220;
+      color: #e5e7eb;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 12px;
+      padding: 8px;
+    }
+    body { --thumb-h: 90px; --card-w: 300px; }
+    .pv-controls { margin-bottom: 6px; }
+    body.controls-hidden .pv-controls { display: none; }
+    .pv-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+    .pv-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+      -webkit-app-region: drag; /* kéo cả thanh header để di chuyển cửa sổ */
+    }
+    .pv-header button, .pv-header input { -webkit-app-region: no-drag; }
+    .pv-title { font-weight: 700; font-size: 13px; flex: 1; }
+    .pv-winbtn {
+      padding: 2px 8px; border-radius: 5px; border: 1px solid #374151;
+      font-size: 12px; cursor: pointer; background: rgba(31,41,55,0.9); color: #cbd5e1;
+      -webkit-app-region: no-drag;
+    }
+    .pv-winbtn.close:hover { background: #dc2626; color: #fff; }
+    .pv-allbtn {
+      padding: 3px 8px; border-radius: 6px; border: 1px solid #374151;
+      font-size: 11px; font-weight: 700; cursor: pointer;
+    }
+    .pv-start { background: linear-gradient(90deg,#16a34a,#22c55e); color:#052e16; }
+    .pv-pause { background: linear-gradient(90deg,#d97706,#f59e0b); color:#2b1900; }
+
+    /* ── Toolbar layout + size ───────────────────────────── */
+    .pv-toolbar {
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      margin-bottom: 8px; padding-bottom: 6px;
+      border-bottom: 1px solid #1f2937;
+    }
+    .pv-tool-btn {
+      padding: 2px 8px; border-radius: 5px; border: 1px solid #374151;
+      font-size: 11px; cursor: pointer; background: rgba(31,41,55,0.8); color: #cbd5e1;
+    }
+    .pv-tool-btn.active { border-color: #3b82f6; color: #60a5fa; background: rgba(29,78,216,0.25); }
+    .pv-tool-label { font-size: 10px; color: #6b7280; }
+    #pv-size { width: 90px; }
+
+    /* ── Containers theo layout ──────────────────────────── */
+    #cards.layout-vertical   { display: flex; flex-direction: column; gap: 8px; }
+    #cards.layout-horizontal { display: flex; flex-direction: row; flex-wrap: nowrap; gap: 8px; overflow-x: auto; padding-bottom: 6px; }
+    #cards.layout-grid       { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--card-w), 1fr)); gap: 8px; }
+
+    .pv-card {
+      background: rgba(2,6,23,0.7);
+      border: 1px solid #1f2937;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    /* Horizontal: cố định bề rộng card theo size */
+    #cards.layout-horizontal .pv-card { flex: 0 0 var(--card-w); width: var(--card-w); }
+    .pv-card.running { border-color: #22c55e; }
+    .pv-card.paused  { border-color: #f59e0b; }
+    .pv-thumb-wrap {
+      position: relative;
+      width: 100%;
+      height: var(--thumb-h);
+      background: #000;
+    }
+    .pv-thumb { width: 100%; height: 100%; object-fit: cover; object-position: top center; display: block; }
+    .pv-overlay {
+      position: absolute; top: 4px; left: 4px;
+      background: rgba(0,0,0,0.6); padding: 2px 6px; border-radius: 5px;
+      font-size: 10px; display: flex; align-items: center; gap: 4px;
+    }
+    .pv-dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7280; }
+    .pv-dot.running { background: #22c55e; }
+    .pv-dot.paused  { background: #f59e0b; }
+    .pv-dot.stopped { background: #ef4444; }
+    .pv-dot.idle    { background: #6b7280; }
+    .pv-footer {
+      display: flex; align-items: center; gap: 4px; padding: 3px 6px;
+    }
+    .pv-label { font-size: 11px; font-weight: 700; }
+    .pv-step { font-size: 10px; color: #9ca3af; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .pv-btn {
+      padding: 2px 7px; border-radius: 5px; border: 1px solid #374151;
+      font-size: 11px; cursor: pointer; background: rgba(31,41,55,0.8); color: #cbd5e1;
+    }
+    .pv-btn.start { background: rgba(22,163,74,0.85); color:#f0fdf4; border-color:#15803d; }
+    .pv-btn.pause { background: rgba(217,119,6,0.85); color:#fff7ed; border-color:#b45309; }
+    .pv-btn:hover { filter: brightness(1.1); }
+  </style>
+</head>
+<body>
+  <div class="pv-header">
+    <span class="pv-title">⠿ Slot Preview</span>
+    <button class="pv-winbtn" id="toggleCtrls" title="Ẩn/hiện các nút">▲</button>
+    <button class="pv-winbtn" id="winMin" title="Thu nhỏ">—</button>
+    <button class="pv-winbtn close" id="winClose" title="Đóng">✕</button>
+  </div>
+
+  <div class="pv-controls" id="pvControls">
+    <div class="pv-row">
+      <button class="pv-allbtn pv-start" id="startAll" title="Start tất cả">▶ All</button>
+      <button class="pv-allbtn pv-pause" id="pauseAll" title="Pause tất cả">⏸ All</button>
+      <button class="pv-tool-btn" id="topTaskbar" title="Ghim nổi trên cả taskbar">📌 Trên taskbar</button>
+    </div>
+    <div class="pv-toolbar">
+      <span class="pv-tool-label">Layout:</span>
+      <button class="pv-tool-btn" id="lay-vertical"   title="Xếp dọc">↕</button>
+      <button class="pv-tool-btn" id="lay-horizontal" title="Hàng ngang (cuộn ngang)">↔</button>
+      <button class="pv-tool-btn" id="lay-grid"       title="Lưới">▦</button>
+      <span class="pv-tool-label" style="margin-left:6px;">Size:</span>
+      <input type="range" id="pv-size" min="50" max="320" step="10" value="90" title="Kích thước mỗi block" />
+    </div>
+  </div>
+
+  <div id="cards"></div>
+
+  <script>
+    const MAX_SLOTS = 3;
+    const api = window.controlAPI;
+    const info = {};
+    for (let i = 1; i <= MAX_SLOTS; i++) {
+      info[i] = { open: false, status: "idle", label: "idle", running: false, thumb: "" };
+    }
+
+    function action(act, slotId) {
+      if (api && typeof api.previewAction === "function") {
+        api.previewAction({ action: act, slotId: slotId });
+      }
+    }
+
+    function render() {
+      const root = document.getElementById("cards");
+      root.innerHTML = "";
+      for (let i = 1; i <= MAX_SLOTS; i++) {
+        const s = info[i];
+        const card = document.createElement("div");
+        card.className = "pv-card " + (s.running ? "running" : (s.status === "paused" ? "paused" : ""));
+
+        const tw = document.createElement("div");
+        tw.className = "pv-thumb-wrap";
+        const img = document.createElement("img");
+        img.className = "pv-thumb";
+        img.dataset.slot = i;
+        if (s.thumb) img.src = s.thumb; else img.style.opacity = "0";
+        img.title = "Double-click để hiện cửa sổ slot";
+        img.addEventListener("dblclick", () => action("show", i));
+        tw.appendChild(img);
+
+        const ov = document.createElement("div");
+        ov.className = "pv-overlay";
+        const dot = document.createElement("span");
+        dot.className = "pv-dot " + (s.running ? "running" : s.status);
+        const ovt = document.createElement("span");
+        ovt.textContent = "Slot " + i;
+        ov.appendChild(dot); ov.appendChild(ovt);
+        tw.appendChild(ov);
+        card.appendChild(tw);
+
+        const footer = document.createElement("div");
+        footer.className = "pv-footer";
+        const lbl = document.createElement("span");
+        lbl.className = "pv-label";
+        lbl.textContent = "S" + i;
+        const step = document.createElement("span");
+        step.className = "pv-step";
+        step.textContent = s.label || "idle";
+
+        const openBtn = document.createElement("button");
+        openBtn.className = "pv-btn";
+        openBtn.textContent = s.open ? "Close" : "Open";
+        openBtn.onclick = () => action(s.open ? "close" : "open", i);
+
+        const startBtn = document.createElement("button");
+        startBtn.className = "pv-btn start";
+        startBtn.textContent = "▶";
+        startBtn.title = "Start / Resume";
+        startBtn.onclick = () => action("start", i);
+
+        const pauseBtn = document.createElement("button");
+        pauseBtn.className = "pv-btn pause";
+        pauseBtn.textContent = "⏸";
+        pauseBtn.title = "Pause";
+        pauseBtn.onclick = () => action("pause", i);
+
+        footer.appendChild(lbl);
+        footer.appendChild(step);
+        footer.appendChild(openBtn);
+        footer.appendChild(startBtn);
+        footer.appendChild(pauseBtn);
+        card.appendChild(footer);
+
+        root.appendChild(card);
+      }
+    }
+
+    // Cập nhật thumbnail mà không rebuild toàn bộ (mượt hơn)
+    function patchThumb(slotId, dataUrl) {
+      const img = document.querySelector('.pv-thumb[data-slot="' + slotId + '"]');
+      if (img) { img.src = dataUrl; img.style.opacity = "1"; }
+    }
+
+    if (api && typeof api.on === "function") {
+      api.on("slot:thumbnail", (d) => {
+        if (!d || !d.slotId) return;
+        info[d.slotId].thumb = d.dataUrl;
+        patchThumb(d.slotId, d.dataUrl);
+      });
+      api.on("slot:page-loaded", (d) => {
+        if (!d || !d.slotId) return;
+        info[d.slotId].open = true;
+        render();
+      });
+      api.on("slot:closed", (d) => {
+        if (!d || !d.slotId) return;
+        info[d.slotId].open = false;
+        info[d.slotId].thumb = "";
+        info[d.slotId].status = "idle";
+        render();
+      });
+      // State đầy đủ do control đẩy sang (label/running/status/open)
+      api.on("preview:states", (d) => {
+        if (!d || !Array.isArray(d.states)) return;
+        d.states.forEach(st => {
+          const i = Number(st.slotId);
+          if (!info[i]) return;
+          info[i].label = st.label || "idle";
+          info[i].running = !!st.running;
+          info[i].status = st.status || "idle";
+          if (typeof st.open === "boolean") info[i].open = st.open;
+        });
+        render();
+      });
+    }
+
+    document.getElementById("startAll").onclick = () => action("startAll", 0);
+    document.getElementById("pauseAll").onclick = () => action("pauseAll", 0);
+
+    // Nút cửa sổ (frameless)
+    document.getElementById("winClose").onclick = () => {
+      if (api && typeof api.closePreviewWindow === "function") api.closePreviewWindow();
+    };
+    document.getElementById("winMin").onclick = () => {
+      if (api && typeof api.minimizePreviewWindow === "function") api.minimizePreviewWindow();
+    };
+
+    // ── Layout + Size controls ──────────────────────────────────
+    const cardsEl = document.getElementById("cards");
+    const sizeEl = document.getElementById("pv-size");
+    const layBtns = {
+      vertical:   document.getElementById("lay-vertical"),
+      horizontal: document.getElementById("lay-horizontal"),
+      grid:       document.getElementById("lay-grid")
+    };
+    let curLayout = localStorage.getItem("pv_layout") || "vertical";
+    let curSize = parseInt(localStorage.getItem("pv_size") || "90", 10);
+    if (!(curSize >= 50 && curSize <= 320)) curSize = 90;
+
+    function applyLayout(name) {
+      curLayout = name;
+      cardsEl.className = "layout-" + name;
+      Object.keys(layBtns).forEach(k => {
+        if (layBtns[k]) layBtns[k].classList.toggle("active", k === name);
+      });
+      try { localStorage.setItem("pv_layout", name); } catch (_) {}
+    }
+    function applySize(px) {
+      curSize = px;
+      // chiều cao thumbnail = px; bề rộng card (ngang/lưới) ~ px * 2 cho tỉ lệ đẹp
+      document.body.style.setProperty("--thumb-h", px + "px");
+      document.body.style.setProperty("--card-w", Math.round(px * 1.7) + "px");
+      if (sizeEl) sizeEl.value = String(px);
+      try { localStorage.setItem("pv_size", String(px)); } catch (_) {}
+    }
+
+    Object.keys(layBtns).forEach(k => {
+      if (layBtns[k]) layBtns[k].onclick = () => applyLayout(k);
+    });
+    if (sizeEl) sizeEl.oninput = () => applySize(parseInt(sizeEl.value, 10) || 90);
+
+    // ── Ẩn/hiện cụm nút function ────────────────────────────────
+    const toggleBtn = document.getElementById("toggleCtrls");
+    let ctrlsHidden = localStorage.getItem("pv_ctrls_hidden") === "1";
+    function applyCtrlsHidden() {
+      document.body.classList.toggle("controls-hidden", ctrlsHidden);
+      if (toggleBtn) toggleBtn.textContent = ctrlsHidden ? "▼" : "▲";
+      try { localStorage.setItem("pv_ctrls_hidden", ctrlsHidden ? "1" : "0"); } catch (_) {}
+    }
+    if (toggleBtn) {
+      toggleBtn.onclick = () => { ctrlsHidden = !ctrlsHidden; applyCtrlsHidden(); };
+    }
+    applyCtrlsHidden();
+
+    // ── Ghim nổi trên cả taskbar ────────────────────────────────
+    const topTbBtn = document.getElementById("topTaskbar");
+    let aboveTaskbar = localStorage.getItem("pv_above_taskbar") === "1";
+    function applyAboveTaskbar() {
+      if (api && typeof api.setPreviewAboveTaskbar === "function") {
+        api.setPreviewAboveTaskbar(aboveTaskbar);
+      }
+      if (topTbBtn) {
+        topTbBtn.classList.toggle("active", aboveTaskbar);
+        topTbBtn.textContent = aboveTaskbar ? "📌 Trên taskbar ✓" : "📌 Trên taskbar";
+      }
+      try { localStorage.setItem("pv_above_taskbar", aboveTaskbar ? "1" : "0"); } catch (_) {}
+    }
+    if (topTbBtn) {
+      topTbBtn.onclick = () => { aboveTaskbar = !aboveTaskbar; applyAboveTaskbar(); };
+    }
+    applyAboveTaskbar();
+
+    applyLayout(curLayout);
+    applySize(curSize);
+    render();
+  </script>
+</body>
+</html>
