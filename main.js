@@ -5,7 +5,7 @@ const os = require("os");
 const fetch = require("node-fetch");
 
 let controlWin = null;
-let previewWin = null; // cửa sổ preview nổi riêng (có icon taskbar)
+const previewWins = new Set(); // các cửa sổ preview nổi (có thể mở nhiều)
 
 // ──────────────────────────────────────────────────
 // Multi-slot web window management
@@ -59,23 +59,27 @@ function sendToControl(channel, data) {
   } catch (err) {
     console.warn("[MAIN] sendToControl error:", err);
   }
-  // Forward đồng thời sang cửa sổ preview nổi (nếu đang mở)
-  try {
-    if (previewWin && !previewWin.isDestroyed()) {
-      previewWin.webContents.send(channel, data);
+  // Forward đồng thời sang TẤT CẢ cửa sổ preview nổi đang mở
+  for (const win of previewWins) {
+    try {
+      if (win && !win.isDestroyed()) {
+        win.webContents.send(channel, data);
+      }
+    } catch (err) {
+      console.warn("[MAIN] sendToControl(preview) error:", err);
     }
-  } catch (err) {
-    console.warn("[MAIN] sendToControl(preview) error:", err);
   }
 }
 
 function sendToPreview(channel, data) {
-  try {
-    if (previewWin && !previewWin.isDestroyed()) {
-      previewWin.webContents.send(channel, data);
+  for (const win of previewWins) {
+    try {
+      if (win && !win.isDestroyed()) {
+        win.webContents.send(channel, data);
+      }
+    } catch (err) {
+      console.warn("[MAIN] sendToPreview error:", err);
     }
-  } catch (err) {
-    console.warn("[MAIN] sendToPreview error:", err);
   }
 }
 
@@ -650,16 +654,18 @@ function createControlWindow() {
   }
 }
 
-// Cửa sổ preview nổi riêng — luôn on-top, có icon trên taskbar Windows
+// Cửa sổ preview nổi riêng — luôn on-top, có icon trên taskbar Windows.
+// Cho phép mở nhiều cửa sổ tuỳ ý; mỗi lần gọi sẽ tạo MỚI một cửa sổ độc lập.
 function createPreviewWindow() {
-  if (previewWin && !previewWin.isDestroyed()) {
-    previewWin.show();
-    previewWin.focus();
-    return previewWin;
-  }
-  previewWin = new BrowserWindow({
+  // Offset vị trí dựa trên số cửa sổ đã mở để không xếp chồng hoàn toàn
+  const idx = previewWins.size;
+  const baseX = 200 + idx * 40;
+  const baseY = 120 + idx * 40;
+  const win = new BrowserWindow({
     width: 320,
     height: 680,
+    x: baseX,
+    y: baseY,
     minWidth: 180,
     minHeight: 200,
     title: "Slot Preview",
@@ -676,24 +682,32 @@ function createPreviewWindow() {
   });
   // KHÔNG dùng level "screen-saver" — trên Windows nó biến cửa sổ thành tool window
   // và bị ẩn khỏi taskbar. Dùng alwaysOnTop mặc định + ép hiện taskbar.
-  previewWin.setAlwaysOnTop(true);
-  previewWin.setSkipTaskbar(false);
-  previewWin.setMenuBarVisibility(false);
+  win.setAlwaysOnTop(true);
+  win.setSkipTaskbar(false);
+  win.setMenuBarVisibility(false);
   // Cho preview 1 appId riêng → có icon taskbar TÁCH BIỆT với cửa sổ control
   try {
-    previewWin.setAppDetails({
+    win.setAppDetails({
       appId: "com.detectlab.camp.preview",
       relaunchDisplayName: "Slot Preview"
     });
   } catch (_) {}
-  previewWin.loadFile(path.join(__dirname, "control", "preview-window.html"));
-  previewWin.once("ready-to-show", () => {
-    previewWin.show();
-    previewWin.setSkipTaskbar(false); // đảm bảo lần nữa sau khi show
+  win.loadFile(path.join(__dirname, "control", "preview-window.html"));
+  win.once("ready-to-show", () => {
+    win.show();
+    win.setSkipTaskbar(false); // đảm bảo lần nữa sau khi show
   });
-  previewWin.on("closed", () => { previewWin = null; });
-  log("preview window created");
-  return previewWin;
+  previewWins.add(win);
+  win.on("closed", () => { previewWins.delete(win); });
+  log(`preview window created (total: ${previewWins.size})`);
+  return win;
+}
+
+// Helper: lấy preview window đã phát IPC từ event.sender
+function previewWinFromEvent(event) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win && previewWins.has(win) && !win.isDestroyed()) return win;
+  return null;
 }
 
 // IPC: bật/tắt always-on-top cho control window
@@ -711,29 +725,32 @@ ipcMain.handle("preview:open-window", async () => {
   return { ok: true };
 });
 
-// IPC: đóng cửa sổ preview nổi
-ipcMain.handle("preview:close-window", async () => {
-  if (previewWin && !previewWin.isDestroyed()) previewWin.close();
+// IPC: đóng cửa sổ preview nổi đã phát IPC (mỗi popout tự đóng chính nó)
+ipcMain.handle("preview:close-window", async (event) => {
+  const win = previewWinFromEvent(event);
+  if (win) win.close();
   return { ok: true };
 });
 
-// IPC: thu nhỏ cửa sổ preview nổi
-ipcMain.handle("preview:minimize-window", async () => {
-  if (previewWin && !previewWin.isDestroyed()) previewWin.minimize();
+// IPC: thu nhỏ cửa sổ preview nổi đã phát IPC
+ipcMain.handle("preview:minimize-window", async (event) => {
+  const win = previewWinFromEvent(event);
+  if (win) win.minimize();
   return { ok: true };
 });
 
-// IPC: ghim preview nổi TRÊN CẢ taskbar (level "screen-saver")
+// IPC: ghim preview nổi TRÊN CẢ taskbar (level "screen-saver") — chỉ cho cửa sổ đã phát IPC
 // flag=true: nổi trên mọi thứ kể cả taskbar/Start menu (nhưng mất icon taskbar riêng)
 // flag=false: nổi bình thường (floating), vẫn ở trên taskbar list
-ipcMain.handle("preview:set-above-taskbar", async (_event, payload) => {
+ipcMain.handle("preview:set-above-taskbar", async (event, payload) => {
   const flag = !!(payload && payload.flag);
-  if (previewWin && !previewWin.isDestroyed()) {
+  const win = previewWinFromEvent(event);
+  if (win) {
     if (flag) {
-      previewWin.setAlwaysOnTop(true, "screen-saver");
+      win.setAlwaysOnTop(true, "screen-saver");
     } else {
-      previewWin.setAlwaysOnTop(true); // level mặc định 'floating'
-      previewWin.setSkipTaskbar(false);
+      win.setAlwaysOnTop(true); // level mặc định 'floating'
+      win.setSkipTaskbar(false);
     }
   }
   return { ok: true, flag };
