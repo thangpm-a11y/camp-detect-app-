@@ -551,9 +551,14 @@ function getTextBySelector(selector) {
     return "";
   }
 
-  // When a popup is open, scope strictly to it. Do NOT fall back to document
-  // (otherwise a generic selector like "body" would read the whole page).
-  const el = modal ? modal.querySelector(selector) : safeSelector(selector);
+  // Khi có popup mở, ưu tiên tìm trong popup. Nhưng nếu KHÔNG thấy trong popup,
+  // fallback về document (selector cụ thể như input[placeholder="Name"] vẫn an toàn,
+  // chỉ tránh fallback khi selector quá rộng kiểu body/html).
+  let el = modal ? modal.querySelector(selector) : safeSelector(selector);
+  if (!el && modal) {
+    const broad = /^(body|html|\*)$/i.test(String(selector).trim());
+    if (!broad) el = safeSelector(selector);
+  }
   return readElementValue(el);
 }
 
@@ -1322,8 +1327,411 @@ async function handleLogTitle() {
   sendLog("Title: " + document.title);
 }
 
+// ── Quick step builder overlay (Feature 2) ─────────────────────────
+function dlBuildSelectorForElement(target) {
+  const tag = target && target.tagName ? target.tagName.toLowerCase() : "div";
+  try {
+    if ((tag === "input" || tag === "textarea") && target.placeholder) {
+      const ph = String(target.placeholder);
+      return ph.includes('"') && !ph.includes("'")
+        ? `${tag}[placeholder='${ph}']`
+        : `${tag}[placeholder="${ph}"]`;
+    }
+    if (target.id) return `${tag}#${target.id}`;
+    if (target.className && typeof target.className === "string") {
+      const safe = target.className.split(/\s+/).filter(c => c && !c.includes(":")).slice(0, 2);
+      const cp = safe.map(c => "." + c.replace(/[^a-zA-Z0-9_-]/g, "")).join("");
+      return cp ? tag + cp : tag;
+    }
+  } catch (_) {}
+  return tag;
+}
+
+// Các field hiển thị theo từng loại step (khớp với editor thật)
+const DL_BUILDER_FIELDS = {
+  click:        ["selector", "point", "clickMode", "delay"],
+  cdpclick:     ["selector", "point", "clickMode", "delay"],
+  hover:        ["selector", "clickMode", "delay"],
+  clicknear:    ["selector", "clicknearDirection", "clicknearIndex", "delay"],
+  pressarrow:   ["selector", "arrowDirection", "arrowCount", "arrowDelay", "delay"],
+  scroll:       ["selector", "delay"],
+  input:        ["selector", "column", "value", "delay"],
+  read:         ["selector", "resultKey", "readMode", "matchText", "delay"],
+  upload:       ["selector", "column", "delay"],
+  download:     ["selector", "point", "column", "fileNameColumn", "delay"],
+  delete:       ["selector", "delay"],
+  open:         ["url", "column", "value", "delay"],
+  opentab:      ["url", "column", "value", "delay"],
+  keypress:     ["key", "delay"],
+  wait:         ["delay"],
+  end:          [],
+  "save-session": ["sessionName", "delay"],
+  "load-session": ["sessionName", "url", "delay"],
+  condition:    ["resultKey", "op", "conditionValueColumn", "conditionValue", "conditionTrueMode", "conditionJumpTo", "delay"]
+};
+
+const DL_FIELD_LABELS = {
+  selector: "Selector",
+  point: "Điểm (x,y)",
+  clickMode: "Click mode",
+  column: "Column",
+  fileNameColumn: "Name column",
+  value: "Value",
+  url: "URL",
+  delay: "Delay (ms)",
+  resultKey: "Result key (Var)",
+  readMode: "Read mode",
+  matchText: "Match text",
+  clicknearDirection: "Hướng",
+  clicknearIndex: "Index",
+  arrowDirection: "Arrow",
+  arrowCount: "Số lần",
+  arrowDelay: "Arrow delay (ms)",
+  key: "Key",
+  sessionName: "Session name",
+  op: "Operator",
+  conditionValueColumn: "Value column",
+  conditionValue: "Value (fixed)",
+  conditionTrueMode: "If FALSE →",
+  conditionJumpTo: "Jump to step #"
+};
+
+const DL_SELECT_OPTIONS = {
+  clickMode: [["selector", "selector"], ["point", "point"]],
+  readMode: [["text", "text"], ["html", "html"]],
+  clicknearDirection: [["up", "up"], ["down", "down"], ["left", "left"], ["right", "right"]],
+  arrowDirection: [["up", "↑ up"], ["down", "↓ down"], ["left", "← left"], ["right", "→ right"]]
+};
+
+let __dlBuilderActive = false;
+
+function handleShowStepBuilder(payload) {
+  const stepType = String((payload && payload.stepType) || "click").toLowerCase();
+  const requestId = (payload && payload.requestId) || "";
+  const old = document.getElementById("__dl_step_builder");
+  if (old) old.remove();
+
+  // Ack ngay để control biết slot đang mở & nhận lệnh
+  try { ipcRenderer.send("web:result", { type: "stepBuilder", requestId, ack: true }); } catch (_) {}
+
+  const fields = DL_BUILDER_FIELDS[stepType] || ["selector", "delay"];
+  const values = { x: null, y: null };
+
+  const panel = document.createElement("div");
+  panel.id = "__dl_step_builder";
+  Object.assign(panel.style, {
+    position: "fixed", top: "12px", right: "12px", width: "300px",
+    background: "rgba(2,6,23,0.97)", color: "#e5e7eb",
+    border: "1px solid #3b82f6", borderRadius: "10px", padding: "10px",
+    zIndex: "2147483647", fontFamily: "system-ui,sans-serif", fontSize: "12px",
+    boxShadow: "0 8px 30px rgba(0,0,0,0.55)"
+  });
+
+  const h = document.createElement("div");
+  h.textContent = "➕ Step mới: " + stepType.toUpperCase();
+  Object.assign(h.style, { fontWeight: "700", marginBottom: "2px", fontSize: "13px", color: "#60a5fa" });
+  panel.appendChild(h);
+
+  const hint = document.createElement("div");
+  hint.textContent = "S: selector · P: point · Ctrl+S: lưu · Esc: hủy";
+  Object.assign(hint.style, { fontSize: "10px", color: "#94a3b8", marginBottom: "8px" });
+  panel.appendChild(hint);
+
+  const inputs = {};
+
+  function addLabeledControl(key, ctrl) {
+    const wrap = document.createElement("div");
+    wrap.style.marginBottom = "6px";
+    const lb = document.createElement("div");
+    lb.textContent = DL_FIELD_LABELS[key] || key;
+    Object.assign(lb.style, { fontSize: "10px", color: "#94a3b8", marginBottom: "2px" });
+    wrap.appendChild(lb);
+    wrap.appendChild(ctrl);
+    panel.appendChild(wrap);
+  }
+
+  function mkInput(key, ph) {
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.placeholder = ph || "";
+    Object.assign(inp.style, {
+      width: "100%", boxSizing: "border-box", padding: "4px 6px",
+      borderRadius: "5px", border: "1px solid #374151",
+      background: "#0b1220", color: "#e5e7eb", fontSize: "12px"
+    });
+    inputs[key] = inp;
+    return inp;
+  }
+
+  fields.forEach(f => {
+    if (f === "selector") {
+      const row = document.createElement("div");
+      Object.assign(row.style, { display: "flex", gap: "4px" });
+      const inp = mkInput("selector", "CSS selector");
+      const pickBtn = document.createElement("button");
+      pickBtn.textContent = "🔵 Pick";
+      Object.assign(pickBtn.style, { flexShrink: "0", padding: "4px 8px", borderRadius: "5px", border: "1px solid #2563eb", background: "#1d4ed8", color: "#fff", cursor: "pointer", fontSize: "11px" });
+      pickBtn.onclick = () => startInlinePick("selector");
+      row.appendChild(inp);
+      row.appendChild(pickBtn);
+      addLabeledControl("selector", row);
+    } else if (f === "point") {
+      const row = document.createElement("div");
+      Object.assign(row.style, { display: "flex", gap: "4px", alignItems: "center" });
+      const span = document.createElement("span");
+      span.id = "__dl_point_label";
+      span.textContent = "(chưa chọn)";
+      Object.assign(span.style, { flex: "1", fontSize: "11px", color: "#cbd5e1" });
+      const pickBtn = document.createElement("button");
+      pickBtn.textContent = "🎯 Pick point";
+      Object.assign(pickBtn.style, { flexShrink: "0", padding: "4px 8px", borderRadius: "5px", border: "1px solid #b45309", background: "#d97706", color: "#fff", cursor: "pointer", fontSize: "11px" });
+      pickBtn.onclick = () => startInlinePick("point");
+      row.appendChild(span);
+      row.appendChild(pickBtn);
+      addLabeledControl("point", row);
+    } else if (f === "op") {
+      const sel = document.createElement("select");
+      Object.assign(sel.style, { width: "100%", padding: "4px", borderRadius: "5px", border: "1px solid #374151", background: "#0b1220", color: "#e5e7eb", fontSize: "12px" });
+      [["", "(none)"], ["equal", "equal"], ["exact", "exact"], ["different", "different"], ["contain", "contain"], [">", ">"], ["<", "<"], [">=", "≥"], ["<=", "≤"]].forEach(([v, l]) => {
+        const o = document.createElement("option"); o.value = v; o.textContent = l; sel.appendChild(o);
+      });
+      inputs.op = sel;
+      addLabeledControl("op", sel);
+    } else if (f === "conditionTrueMode") {
+      const sel = document.createElement("select");
+      Object.assign(sel.style, { width: "100%", padding: "4px", borderRadius: "5px", border: "1px solid #374151", background: "#0b1220", color: "#e5e7eb", fontSize: "12px" });
+      [["stop", "Stop (when FALSE)"], ["jump", "Jump to step (when FALSE)"]].forEach(([v, l]) => {
+        const o = document.createElement("option"); o.value = v; o.textContent = l; sel.appendChild(o);
+      });
+      inputs.conditionTrueMode = sel;
+      addLabeledControl("conditionTrueMode", sel);
+    } else if (DL_SELECT_OPTIONS[f]) {
+      const sel = document.createElement("select");
+      Object.assign(sel.style, { width: "100%", padding: "4px", borderRadius: "5px", border: "1px solid #374151", background: "#0b1220", color: "#e5e7eb", fontSize: "12px" });
+      DL_SELECT_OPTIONS[f].forEach(([v, l]) => {
+        const o = document.createElement("option"); o.value = v; o.textContent = l; sel.appendChild(o);
+      });
+      inputs[f] = sel;
+      addLabeledControl(f, sel);
+    } else if (f === "delay") {
+      const inp = mkInput("delay", "300");
+      inp.value = "300";
+      addLabeledControl("delay", inp);
+    } else {
+      addLabeledControl(f, mkInput(f, ""));
+    }
+  });
+
+  // Buttons
+  const btnRow = document.createElement("div");
+  Object.assign(btnRow.style, { display: "flex", gap: "6px", marginTop: "8px" });
+  const saveBtn = document.createElement("button");
+  saveBtn.textContent = "✓ Thêm step (Enter)";
+  Object.assign(saveBtn.style, { flex: "1", padding: "6px", borderRadius: "6px", border: "1px solid #15803d", background: "linear-gradient(90deg,#16a34a,#22c55e)", color: "#052e16", cursor: "pointer", fontWeight: "700", fontSize: "12px" });
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "✕";
+  Object.assign(cancelBtn.style, { padding: "6px 10px", borderRadius: "6px", border: "1px solid #b91c1c", background: "#dc2626", color: "#fff", cursor: "pointer", fontWeight: "700" });
+  btnRow.appendChild(saveBtn);
+  btnRow.appendChild(cancelBtn);
+  panel.appendChild(btnRow);
+
+  let highlightEl = null;
+  function clearHighlight() { try { if (highlightEl) highlightEl.remove(); highlightEl = null; } catch (_) {} }
+
+  function startInlinePick(mode) {
+    panel.style.display = "none";
+    const tip = document.createElement("div");
+    Object.assign(tip.style, { position: "fixed", top: "8px", left: "50%", transform: "translateX(-50%)", background: "rgba(15,23,42,0.95)", color: mode === "point" ? "#f59e0b" : "#38bdf8", padding: "6px 16px", borderRadius: "999px", fontSize: "13px", fontWeight: "700", zIndex: "2147483647", pointerEvents: "none", border: "1px solid rgba(56,189,248,0.5)" });
+    tip.textContent = mode === "point" ? "🎯 Click để chọn điểm — ESC hủy" : "🔵 Click để chọn element — ESC hủy";
+    document.body.appendChild(tip);
+
+    function cleanup() {
+      try { tip.remove(); } catch (_) {}
+      document.removeEventListener("click", onClick, true);
+      document.removeEventListener("keydown", onEsc, true);
+      panel.style.display = "block";
+    }
+    function onEsc(e) { if (e.key === "Escape") { cleanup(); } }
+    function onClick(ev) {
+      ev.preventDefault(); ev.stopPropagation(); ev.stopImmediatePropagation();
+      const target = document.elementFromPoint(ev.clientX, ev.clientY) || document.body;
+      if (mode === "point") {
+        values.x = Math.round(ev.clientX + window.scrollX);
+        values.y = Math.round(ev.clientY + window.scrollY);
+        const lbl = document.getElementById("__dl_point_label");
+        if (lbl) lbl.textContent = values.x + ", " + values.y;
+      } else {
+        const sel = dlBuildSelectorForElement(target);
+        if (inputs.selector) inputs.selector.value = sel;
+        // Thu thập thông tin phong phú giống picker Sel thật
+        try {
+          values.x = Math.round((target.getBoundingClientRect().left + target.getBoundingClientRect().width / 2) + window.scrollX);
+          values.y = Math.round((target.getBoundingClientRect().top + target.getBoundingClientRect().height / 2) + window.scrollY);
+          values.elementText = String(target.innerText || target.textContent || "").trim().slice(0, 200);
+          let labelText = "";
+          if (target.id) {
+            const fl = document.querySelector('label[for="' + target.id + '"]');
+            if (fl) labelText = (fl.innerText || fl.textContent || "").trim();
+          }
+          if (!labelText && typeof target.closest === "function") {
+            const pl = target.closest("label");
+            if (pl) labelText = (pl.innerText || pl.textContent || "").trim();
+          }
+          values.labelText = labelText;
+          const cont = (typeof target.closest === "function" && target.closest("div,section,article,li,td,th")) || target.parentElement;
+          if (cont) {
+            values.containerTag = cont.tagName ? cont.tagName.toLowerCase() : "";
+            if (cont.className && typeof cont.className === "string") {
+              values.containerClassName = cont.className.split(/\s+/).filter(c => c && !c.includes(":")).slice(0, 2).join(" ");
+            }
+          }
+        } catch (_) {}
+        // highlight
+        try {
+          clearHighlight();
+          const r = target.getBoundingClientRect();
+          highlightEl = document.createElement("div");
+          Object.assign(highlightEl.style, { position: "fixed", left: (r.left - 2) + "px", top: (r.top - 2) + "px", width: (r.width + 4) + "px", height: (r.height + 4) + "px", border: "2px solid #38bdf8", borderRadius: "4px", pointerEvents: "none", zIndex: "2147483646", background: "rgba(56,189,248,0.08)" });
+          document.body.appendChild(highlightEl);
+          setTimeout(clearHighlight, 1500);
+        } catch (_) {}
+      }
+      cleanup();
+      // pick xong → focus ô value đầu tiên để gõ ngay (delay/column...)
+      focusFirstField();
+    }
+    document.addEventListener("click", onClick, true);
+    document.addEventListener("keydown", onEsc, true);
+  }
+
+  function finish(ok) {
+    __dlBuilderActive = false;
+    clearHighlight();
+    try { panel.remove(); } catch (_) {}
+    document.removeEventListener("keydown", onKey, true);
+    const out = { type: "stepBuilder", requestId, ok, stepType, fields: {}, fromSlot: !!(payload && payload.fromSlot) };
+    if (ok) {
+      Object.keys(inputs).forEach(k => { out.fields[k] = inputs[k].value; });
+      out.fields.x = values.x;
+      out.fields.y = values.y;
+      out.fields.labelText = values.labelText;
+      out.fields.elementText = values.elementText;
+      out.fields.containerTag = values.containerTag;
+      out.fields.containerClassName = values.containerClassName;
+    }
+    ipcRenderer.send("web:result", out);
+  }
+
+  function inField(e) {
+    const t = e.target;
+    const tag = t && t.tagName ? t.tagName.toLowerCase() : "";
+    return tag === "input" || tag === "textarea" || tag === "select";
+  }
+  function focusFirstField() {
+    const all = panel.querySelectorAll("input,select");
+    for (let i = 0; i < all.length; i++) {
+      if (all[i] !== inputs.selector) { try { all[i].focus(); } catch (_) {} return; }
+    }
+    if (all[0]) try { all[0].focus(); } catch (_) {}
+  }
+  function onKey(e) {
+    // Ctrl+S lưu, Esc hủy — luôn áp dụng kể cả khi đang gõ trong field
+    if ((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); finish(true); return; }
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); finish(false); return; }
+    // Command mode (chưa focus vào field): S=selector, P=point, Enter=lưu
+    if (!inField(e)) {
+      const k = String(e.key).toLowerCase();
+      if (k === "s") { e.preventDefault(); startInlinePick("selector"); }
+      else if (k === "p") { e.preventDefault(); startInlinePick("point"); }
+      else if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    }
+  }
+
+  saveBtn.onclick = () => finish(true);
+  cancelBtn.onclick = () => finish(false);
+  document.addEventListener("keydown", onKey, true);
+
+  document.body.appendChild(panel);
+  __dlBuilderActive = true;
+  // KHÔNG auto-focus → vào "command mode": bấm S/P để pick ngay, không cần chuột.
+  // (sau khi pick xong sẽ tự focus vào ô value đầu tiên để gõ)
+  sendStatus("Step builder: " + stepType + " — S/P để pick, Ctrl+S lưu");
+}
+
+// ── Phím tắt NGAY TRÊN cửa sổ slot để thêm step ────────────────────
+// Bật/tắt bằng Ctrl+Shift+B; mặc định TẮT để không cản trở thao tác web.
+const DL_SLOT_QUICK_KEYS = {
+  c: "click", h: "hover", i: "input", r: "read", k: "condition",
+  u: "upload", d: "download", o: "open", w: "wait", e: "end", x: "delete"
+};
+let __dlSlotQuickOn = false;
+
+function dlToggleQuickKeys(on) {
+  __dlSlotQuickOn = (typeof on === "boolean") ? on : !__dlSlotQuickOn;
+  // Badge hiển thị trạng thái
+  let badge = document.getElementById("__dl_quick_badge");
+  if (__dlSlotQuickOn) {
+    if (!badge) {
+      badge = document.createElement("div");
+      badge.id = "__dl_quick_badge";
+      Object.assign(badge.style, {
+        position: "fixed", bottom: "10px", right: "10px", zIndex: "2147483647",
+        background: "rgba(22,163,74,0.92)", color: "#fff", padding: "5px 10px",
+        borderRadius: "8px", fontSize: "11px", fontFamily: "system-ui,sans-serif",
+        fontWeight: "700", pointerEvents: "none", boxShadow: "0 4px 14px rgba(0,0,0,0.4)"
+      });
+      document.body.appendChild(badge);
+    }
+    badge.textContent = "⌨ Quick-add ON — c/i/r/k/h/u/d/o/w/e/x  (Ctrl+Shift+B tắt)";
+    badge.style.display = "block";
+  } else if (badge) {
+    badge.style.display = "none";
+  }
+  sendStatus("Slot quick-keys: " + (__dlSlotQuickOn ? "ON" : "OFF"));
+}
+
+document.addEventListener("keydown", (ev) => {
+  // Bật/tắt nhanh
+  if (ev.ctrlKey && ev.shiftKey && String(ev.key).toLowerCase() === "b") {
+    ev.preventDefault();
+    dlToggleQuickKeys();
+    return;
+  }
+  if (!__dlSlotQuickOn) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (__dlBuilderActive || document.getElementById("__dl_step_builder")) return;
+  const t = ev.target;
+  const tag = t && t.tagName ? t.tagName.toLowerCase() : "";
+  if (tag === "input" || tag === "textarea" || tag === "select" || (t && t.isContentEditable)) return;
+  const key = String(ev.key || "").toLowerCase();
+  if (DL_SLOT_QUICK_KEYS[key]) {
+    ev.preventDefault();
+    // Mở overlay nhập step NGAY trên slot; control sẽ ghi nhận khi lưu
+    handleShowStepBuilder({
+      stepType: DL_SLOT_QUICK_KEYS[key],
+      requestId: "kbd-" + Date.now() + "-" + Math.random().toString(36).slice(2),
+      fromSlot: true
+    });
+  }
+}, true);
+
 async function handleGetText(payload, requestId) {
   const text = getTextByPayload(payload);
+  try {
+    const sel = payload && payload.selector ? String(payload.selector) : "";
+    const modal = getActiveModalRoot();
+    let el = null;
+    if (payloadHasNarrowingHints(payload)) el = findElementForStep(payload);
+    else if (sel) el = (modal && modal.querySelector(sel)) || safeSelector(sel);
+    console.log("[WEB] getText:", {
+      selector: sel,
+      modalOpen: !!modal,
+      found: !!el,
+      tag: el && el.tagName,
+      value: el ? (el.value != null ? el.value : (el.innerText || el.textContent || "")) : null,
+      returned: text
+    });
+  } catch (_) {}
   sendResult({
     requestId,
     type: "getText",
@@ -2329,6 +2737,11 @@ return;
 
     if (type === "openUrl") {
       await handleOpenUrlInPage(value || selector || "");
+      return;
+    }
+
+    if (type === "showStepBuilder") {
+      handleShowStepBuilder(payload);
       return;
     }
 

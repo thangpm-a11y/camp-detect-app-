@@ -16,11 +16,12 @@ function hasControlAPI() {
 function safeOnWebResult(handler) {
   try {
     if (hasControlAPI() && typeof window.controlAPI.onWebResult === "function") {
-      window.controlAPI.onWebResult(handler);
+      return window.controlAPI.onWebResult(handler);
     }
   } catch (err) {
     console.warn("[DetectLab] onWebResult bind error:", err);
   }
+  return null;
 }
 
 safeOnWebResult(data => {
@@ -33,6 +34,12 @@ safeOnWebResult(data => {
         steps[index].x = data.x;
         steps[index].y = data.y;
         steps[index].clickMode = "point";
+        // Cập nhật live vào editor nếu đang mở đúng step này
+        if (activeEditorCtx && activeEditorCtx.stepId === data.stepId) {
+          if (activeEditorCtx.xInput) activeEditorCtx.xInput.value = String(data.x);
+          if (activeEditorCtx.yInput) activeEditorCtx.yInput.value = String(data.y);
+          if (activeEditorCtx.clickModeSelect) activeEditorCtx.clickModeSelect.value = "point";
+        }
         setLog("Picked point for step " + (steps[index].fieldId || index + 1));
         renderSteps();
       }
@@ -123,6 +130,13 @@ safeOnWebResult(data => {
         step.containerTag = String(info.containerTag || "").trim();
         step.containerClassName = String(info.containerClassName || "").trim();
 
+        // Cập nhật live vào editor nếu đang mở đúng step này
+        if (activeEditorCtx && activeEditorCtx.stepId === data.stepId) {
+          if (activeEditorCtx.selectorInput) activeEditorCtx.selectorInput.value = step.selector;
+          if (activeEditorCtx.xInput) activeEditorCtx.xInput.value = String(data.x);
+          if (activeEditorCtx.yInput) activeEditorCtx.yInput.value = String(data.y);
+          if (activeEditorCtx.clickModeSelect) activeEditorCtx.clickModeSelect.value = "selector";
+        }
         setLog("Picked selector for step " + (step.fieldId || index + 1));
         renderSteps();
       }
@@ -215,18 +229,26 @@ function domGetText(selector, _slotId) {
 function domGetTextForStep(step, _slotId, rowObj, _dvars) {
   return new Promise(resolve => {
     const requestId = "getText-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    let done = false;
+    let off = null;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      try { if (typeof off === "function") off(); } catch (_) {}
+      resolve(val);
+    };
     const handler = data => {
       try {
         if (!data) return;
         if (data.type === "getText" && data.requestId === requestId) {
-          resolve(typeof data.text === "string" ? data.text : "");
+          finish(typeof data.text === "string" ? data.text : "");
         }
       } catch (err) {
         console.warn("[DetectLab] domGetTextForStep handler error:", err);
-        resolve("");
+        finish("");
       }
     };
-    safeOnWebResult(handler);
+    off = safeOnWebResult(handler);
     const payload = buildSelectorPayloadFromStep(step, rowObj, _dvars);
     domExec({
       type: "getText",
@@ -235,6 +257,33 @@ function domGetTextForStep(step, _slotId, rowObj, _dvars) {
       y: step && typeof step.y === "number" ? step.y : undefined,
       requestId
     }, _slotId);
+    // Không treo vô hạn nếu web không phản hồi (slot chưa mở / sai trang)
+    setTimeout(() => { if (!done) { console.warn("[DetectLab] getText timeout", requestId); finish("__NO_RESPONSE__"); } }, 8000);
+  });
+}
+
+// Hiện overlay step-builder trên slot web, chờ user nhập + Save → trả {ok, stepType, fields}
+function domShowStepBuilder(stepType, _slotId) {
+  return new Promise(resolve => {
+    const requestId = "stepBuilder-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    let done = false;
+    let off = null;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      try { if (typeof off === "function") off(); } catch (_) {}
+      resolve(val);
+    };
+    let gotAck = false;
+    const handler = data => {
+      if (!data || data.type !== "stepBuilder" || data.requestId !== requestId) return;
+      if (data.ack) { gotAck = true; return; }
+      finish(data);
+    };
+    off = safeOnWebResult(handler);
+    domExec({ type: "showStepBuilder", stepType, requestId }, _slotId);
+    // Nếu 3s không có ack → slot chưa mở / sai trang
+    setTimeout(() => { if (!done && !gotAck) finish({ ok: false, noResponse: true }); }, 3000);
   });
 }
 
@@ -378,6 +427,14 @@ type: "scrollIntoView",
 const MAX_SLOTS = 3;
 let activeSlotId = 1;
 
+// Lưu giá trị READ gần nhất theo "slotId:stepId" để hiển thị trên card (không persist).
+const lastReadByStep = {};
+// Lưu kết quả CONDITION gần nhất (true/false) theo "slotId:stepId".
+const lastConditionByStep = {};
+function readKey(slotId, step) {
+  return String(slotId) + ":" + String((step && step.id) || (step && step.fieldId) || "");
+}
+
 /**
  * Tạo state mặc định cho 1 slot.
  * Mỗi slot có toàn bộ runtime state độc lập.
@@ -516,6 +573,20 @@ window.controlAPI.on("slot:page-loaded", data => {
   // Expose slot states để preview panel đọc step/row hiện tại theo slot
   window.__DL_SLOT_STATES__ = slotStates;
 
+  // ── Groups (dùng chung mọi slot) ───────────────────────────────
+  // groups = { [name]: { name, steps: [...stepObjects], ts } }
+  let groups = {};
+  // Step được tick chọn (theo step.id) để gộp thành group
+  let selectedStepIds = new Set();
+  // Group được tick chọn (theo tên) để combine
+  let selectedGroupNames = new Set();
+  // Trạng thái gấp/mở của group trong danh sách Steps (theo tên group)
+  const groupCollapsed = {};
+  // Group rỗng vừa tạo (chưa có step) — hiện placeholder để kéo step vào
+  let pendingEmptyGroups = [];
+  // Editor step đang mở — để picker (Pos/Sel) cập nhật live vào các ô của editor
+  let activeEditorCtx = null;
+
   // Proxy shortcuts — các hàm cũ dùng trực tiếp các biến này
   // Hướng dẫn: KHÔNG dùng các biến này trong hàm mới,
   //              thay vào đó dùng S().steps, S().rowData, v.v.
@@ -594,10 +665,11 @@ st.draggingIndex = draggingIndex;
     const id = slotId || activeSlotId || 1;
     const sfx = id === 1 ? "" : `_s${id}`;
     return {
-      // PATTERNS, NOTI dùng CHUNG cho mọi slot (không có suffix)
-      // → tab Pattern & Noti được đồng bộ hóa giữa các slot.
+      // PATTERNS, NOTI, GROUPS dùng CHUNG cho mọi slot (không có suffix)
+      // → tab Pattern / Noti / Groups được đồng bộ hóa giữa các slot.
       PATTERNS:        "campDetectPatterns",
       NOTI:            "campDetectNotiRules",
+      GROUPS:          "campDetectGroups",
       // IMAGES (tab Media) tách RIÊNG theo từng slot.
       IMAGES:          "campDetectImages"            + sfx,
       // Các state còn lại vẫn riêng theo từng slot
@@ -942,6 +1014,12 @@ merged.fileNameColumn = "";
 
 if ((merged.type === "open" || merged.type === "opentab") && !String(merged.url || "").trim()) {
 merged.url = String(merged.value || "").trim();
+}
+
+// Read step KHÔNG dùng column nữa — dọn column khỏi step cũ để không hiện pill
+// và không ghi nhầm vào sheet data.
+if (merged.type === "read") {
+merged.column = "";
 }
 
 return merged;
@@ -1335,12 +1413,12 @@ window.addEventListener("message", event => {
     btn.type = "button";
     btn.textContent = text;
     Object.assign(btn.style, {
-      padding: "5px 8px",
+      padding: "5px 10px",
       border: "none",
-      borderRadius: "999px",
-      background: bg || "linear-gradient(90deg,#334155,#1f2937)",
+      borderRadius: "6px",
+      background: bg || "rgba(255,255,255,0.08)",
       color: color || "#e5e7eb",
-      fontWeight: "600",
+      fontWeight: "500",
       cursor: "pointer",
       fontSize: "11px"
     });
@@ -1424,10 +1502,10 @@ window.addEventListener("message", event => {
   function makeSectionCard() {
     const box = document.createElement("div");
     Object.assign(box.style, {
-      padding: "6px 8px",
+      padding: "8px 10px",
       borderRadius: "8px",
-      background: "rgba(15,23,42,0.96)",
-      border: "1px solid rgba(30,64,175,0.55)"
+      background: "rgba(255,255,255,0.025)",
+      border: "none"
     });
     return box;
   }
@@ -1657,12 +1735,14 @@ window.addEventListener("message", event => {
     }
 
     const tabSteps = makeTab("Steps", "steps");
+    const tabGroups = makeTab("Groups", "groups");
     const tabPatterns = makeTab("Patterns", "patterns");
     const tabImages = makeTab("Images", "images");
     const tabNoti = makeTab("Noti", "noti");
     const tabSession = makeTab("Session", "session");
 
     tabs.appendChild(tabSteps);
+    tabs.appendChild(tabGroups);
     tabs.appendChild(tabPatterns);
     tabs.appendChild(tabImages);
     tabs.appendChild(tabNoti);
@@ -1682,6 +1762,16 @@ window.addEventListener("message", event => {
     panelSteps.id = "dlpanelsteps";
     Object.assign(panelSteps.style, {
       display: "flex",
+      flexDirection: "column",
+      flex: "1",
+      minHeight: "0",
+      overflowY: "auto"
+    });
+
+    const panelGroups = document.createElement("div");
+    panelGroups.id = "dlpanelgroups";
+    Object.assign(panelGroups.style, {
+      display: "none",
       flexDirection: "column",
       flex: "1",
       minHeight: "0",
@@ -1728,6 +1818,7 @@ window.addEventListener("message", event => {
     });
 
     panelsWrapper.appendChild(panelSteps);
+    panelsWrapper.appendChild(panelGroups);
     panelsWrapper.appendChild(panelPatterns);
     panelsWrapper.appendChild(panelImages);
     panelsWrapper.appendChild(panelNoti);
@@ -1736,6 +1827,7 @@ window.addEventListener("message", event => {
     function switchTab(name) {
       const map = {
         steps: panelSteps,
+        groups: panelGroups,
         patterns: panelPatterns,
         images: panelImages,
         noti: panelNoti,
@@ -1746,21 +1838,25 @@ window.addEventListener("message", event => {
         map[key].style.display = key === name ? "flex" : "none";
       });
 
-      [tabSteps, tabPatterns, tabImages, tabNoti, tabSession].forEach(btn => {
+      [tabSteps, tabGroups, tabPatterns, tabImages, tabNoti, tabSession].forEach(btn => {
         const active = btn.dataset.tab === name;
         btn.style.background = active ? "#1d4ed8" : "#020617";
         btn.style.color = active ? "#e5e7eb" : "#9ca3af";
       });
 
       if (name === "session") renderSessionPanel(panelSession);
+      if (name === "groups") renderGroupsPanel();
     }
 
     tabSteps.onclick = () => switchTab("steps");
+    tabGroups.onclick = () => switchTab("groups");
     tabPatterns.onclick = () => switchTab("patterns");
     tabImages.onclick = () => switchTab("images");
     tabNoti.onclick = () => switchTab("noti");
     tabSession.onclick = () => switchTab("session");
     switchTab("steps");
+
+    buildGroupsPanel(panelGroups);
 
     root.innerHTML = "";
     root.style.minHeight = "0";
@@ -1900,6 +1996,17 @@ window.addEventListener("message", event => {
     const addStepBtn = makeBtn("Add step", "linear-gradient(90deg,#a855f7,#6366f1)", "#e5e7eb");
     const duplicateAllBtn = makeBtn("Refresh values", "linear-gradient(90deg,#e5e7eb,#94a3b8)", "#020617");
     const clearBtn = makeBtn("Clear", "linear-gradient(90deg,#f97373,#ef4444)", "#ffffff");
+    const groupSelBtn = makeBtn("Gộp Group", "linear-gradient(90deg,#a855f7,#6366f1)", "#e5e7eb");
+    groupSelBtn.onclick = () => { try { saveSelectedStepsAsGroup(); } catch (e) { console.warn(e); } };
+    const addGroupBtn = makeBtn("+ Group", "linear-gradient(90deg,#8b5cf6,#7c3aed)", "#ede9fe");
+    addGroupBtn.onclick = async () => {
+      const nm = await showPromptModal("Tên group mới:", "");
+      if (!nm || !nm.trim()) return;
+      const name = nm.trim();
+      if (!pendingEmptyGroups.includes(name)) pendingEmptyGroups.push(name);
+      renderSteps();
+      setLog("Đã tạo group rỗng '" + name + "' — kéo step vào");
+    };
 
     const currentRowLabel = makeSmallLabel("Current row");
     const currentRowInput = makeSmallNumberInput(2, 2, "76px");
@@ -1925,6 +2032,8 @@ window.addEventListener("message", event => {
     controls.appendChild(addStepBtn);
     controls.appendChild(duplicateAllBtn);
     controls.appendChild(clearBtn);
+    controls.appendChild(groupSelBtn);
+    controls.appendChild(addGroupBtn);
     controls.appendChild(currentRowLabel);
     controls.appendChild(currentRowInput);
     controls.appendChild(logBox);
@@ -2155,18 +2264,106 @@ window.addEventListener("message", event => {
       return;
     }
 
+    // Đếm số step theo từng group để hiện trên header
+    const groupCounts = {};
+    steps.forEach(s => { const g = String((s && s.groupName) || "").trim(); if (g) groupCounts[g] = (groupCounts[g] || 0) + 1; });
+
+    // Theo dõi group container đang mở khi render tuần tự
+    let curGroupName = null;
+    let curGroupBody = null;
+
+    function startGroup(name) {
+      curGroupName = name;
+      const collapsed = !!groupCollapsed[name];
+      const wrap = document.createElement("div");
+      Object.assign(wrap.style, {
+        borderRadius: "8px", margin: "6px 0",
+        background: "rgba(255,255,255,0.03)",
+        borderLeft: "2px solid rgba(139,92,246,0.55)"
+      });
+      const head = document.createElement("div");
+      Object.assign(head.style, {
+        display: "flex", alignItems: "center", gap: "8px",
+        padding: "6px 8px", cursor: "pointer", userSelect: "none"
+      });
+      const caret = document.createElement("span");
+      caret.textContent = collapsed ? "▸" : "▾";
+      caret.style.color = "#c4b5fd";
+      const tag = document.createElement("span");
+      tag.textContent = "▦ GROUP";
+      Object.assign(tag.style, { fontSize: "10px", fontWeight: "700", color: "#c4b5fd" });
+      const nm = document.createElement("span");
+      nm.textContent = name + " (" + (groupCounts[name] || 0) + ")";
+      Object.assign(nm.style, { fontSize: "12px", fontWeight: "700", color: "#e9d5ff", flex: "1" });
+
+      const saveGBtn = document.createElement("button");
+      saveGBtn.textContent = "💾";
+      saveGBtn.title = "Lưu group này vào tab Groups";
+      Object.assign(saveGBtn.style, { fontSize: "11px", border: "1px solid #6d28d9", background: "rgba(109,40,217,0.5)", color: "#ede9fe", borderRadius: "5px", cursor: "pointer", padding: "1px 6px" });
+      saveGBtn.onclick = (e) => { e.stopPropagation(); saveInlineGroupToLibrary(name); };
+
+      const ungBtn = document.createElement("button");
+      ungBtn.textContent = "Ungroup";
+      Object.assign(ungBtn.style, { fontSize: "11px", border: "1px solid #475569", background: "rgba(51,65,85,0.7)", color: "#cbd5e1", borderRadius: "5px", cursor: "pointer", padding: "1px 6px" });
+      ungBtn.onclick = (e) => {
+        e.stopPropagation();
+        steps.forEach(s => { if (s && String(s.groupName || "").trim() === name) delete s.groupName; });
+        flushProxies();
+        renderSteps();
+      };
+
+      const body = document.createElement("div");
+      Object.assign(body.style, { padding: "0 6px 6px 6px", display: collapsed ? "none" : "block", minHeight: "10px" });
+
+      // Thả step vào vùng group → step nhận group này (đưa xuống cuối group)
+      const acceptDrop = (e) => {
+        e.preventDefault(); e.stopPropagation();
+        if (draggingIndex == null) return;
+        const moved = steps[draggingIndex];
+        if (!moved) { draggingIndex = null; return; }
+        steps.splice(draggingIndex, 1);
+        moved.groupName = name;
+        clearPendingEmpty(name);
+        // tìm vị trí cuối cùng của group này rồi chèn sau
+        let lastIdx = -1;
+        steps.forEach((s, i) => { if (s && String(s.groupName || "").trim() === name) lastIdx = i; });
+        steps.splice(lastIdx + 1, 0, moved);
+        draggingIndex = null;
+        flushProxies();
+        renderSteps();
+      };
+      body.addEventListener("dragover", e => { e.preventDefault(); });
+      body.addEventListener("drop", acceptDrop);
+      head.addEventListener("dragover", e => { e.preventDefault(); });
+      head.addEventListener("drop", acceptDrop);
+
+      head.onclick = () => { groupCollapsed[name] = !groupCollapsed[name]; renderSteps(); };
+
+      head.appendChild(caret);
+      head.appendChild(tag);
+      head.appendChild(nm);
+      head.appendChild(saveGBtn);
+      head.appendChild(ungBtn);
+      wrap.appendChild(head);
+      wrap.appendChild(body);
+      container.appendChild(wrap);
+      curGroupBody = body;
+    }
+
     steps.forEach((step, index) => {
       const row = document.createElement("div");
       row.draggable = true;
       row.dataset.index = String(index);
       Object.assign(row.style, {
-        padding: "8px",
-        marginBottom: "6px",
+        padding: "8px 10px",
+        marginBottom: "4px",
         borderRadius: "8px",
         background: currentStepRunning && currentStepRunning.id === step.id
-          ? "rgba(30,64,175,0.35)"
-          : "rgba(15,23,42,0.95)",
-        border: "1px solid rgba(37,99,235,0.6)",
+          ? "rgba(59,130,246,0.18)"
+          : "rgba(255,255,255,0.03)",
+        border: "none",
+        boxShadow: currentStepRunning && currentStepRunning.id === step.id
+          ? "inset 0 0 0 1px rgba(59,130,246,0.5)" : "none",
         display: "flex",
         flexDirection: "column",
         gap: "6px"
@@ -2182,11 +2379,20 @@ window.addEventListener("message", event => {
 
       row.addEventListener("drop", e => {
         e.preventDefault();
+        e.stopPropagation();
         const targetIndex = index;
         if (draggingIndex == null || draggingIndex === targetIndex) return;
-        const moved = steps.splice(draggingIndex, 1)[0];
-        steps.splice(targetIndex, 0, moved);
+        const moved = steps[draggingIndex];
+        const targetStep = steps[targetIndex];
+        if (!moved || !targetStep) { draggingIndex = null; return; }
+        // Thả lên step nào → nhận group của step đó (kéo vào group / ra ngoài)
+        const targetGroup = String(targetStep.groupName || "").trim();
+        steps.splice(draggingIndex, 1);
+        const ti = steps.indexOf(targetStep);
+        if (targetGroup) moved.groupName = targetGroup; else delete moved.groupName;
+        steps.splice(ti + 1, 0, moved);
         draggingIndex = null;
+        flushProxies();
         renderSteps();
       });
 
@@ -2284,6 +2490,19 @@ window.addEventListener("message", event => {
       const btnDup = makeBtn("Dup", "linear-gradient(90deg,#e5e7eb,#94a3b8)", "#020617");
       const btnDel = makeBtn("Del", "linear-gradient(90deg,#f97373,#ef4444)", "#fff");
 
+      // Checkbox chọn step để gộp thành group
+      const selChk = document.createElement("input");
+      selChk.type = "checkbox";
+      selChk.title = "Chọn step để gộp Group";
+      selChk.checked = selectedStepIds.has(step.id);
+      selChk.style.cursor = "pointer";
+      selChk.onclick = (ev) => { ev.stopPropagation(); };
+      selChk.onchange = () => {
+        if (selChk.checked) selectedStepIds.add(step.id);
+        else selectedStepIds.delete(step.id);
+      };
+
+      topLine.appendChild(selChk);
       topLine.appendChild(orderBadge);
       topLine.appendChild(title);
       topLine.appendChild(typeBadge);
@@ -2329,11 +2548,40 @@ window.addEventListener("message", event => {
         meta.appendChild(makeMetaPill("mode", step.clickMode));
       }
 
-      if ((step.type === "read" || step.type === "return" || step.type === "input" || step.type === "condition") &&
-          (step.resultKey || step.fieldId)) {
-        const keyName = (step.resultKey || step.fieldId).trim();
+      // Var = CHỈ Result key (không lấy Step name/Field ID làm var)
+      if ((step.type === "read" || step.type === "return" || step.type === "input") &&
+          step.resultKey) {
+        const keyName = String(step.resultKey).trim();
         if (keyName) {
           meta.appendChild(makeMetaPill("var", keyName));
+        }
+      }
+      // Condition: hiện biến đang kiểm tra (check var)
+      if (step.type === "condition") {
+        const cvar = String(step.resultKey || "").trim();
+        meta.appendChild(makeMetaPill("check", cvar ? cvar : "last read"));
+      }
+
+      // Hiện giá trị READ gần nhất ngay trên card (read step)
+      if (step.type === "read") {
+        const rv = lastReadByStep[readKey(activeSlotId, step)];
+        if (rv !== undefined && rv !== null) {
+          const rvStr = String(rv).trim();
+          const short = rvStr.length > 80 ? rvStr.slice(0, 77) + "..." : (rvStr || "(empty)");
+          const rvPill = makeMetaPill("read", short);
+          rvPill.title = rvStr || "(empty)";
+          meta.appendChild(rvPill);
+        }
+      }
+
+      // Hiện kết quả CONDITION gần nhất (TRUE/false) trên card
+      if (step.type === "condition") {
+        const cv = lastConditionByStep[readKey(activeSlotId, step)];
+        if (cv !== undefined) {
+          const cPill = makeMetaPill("result", cv ? "✓ TRUE" : "✗ false");
+          cPill.style.background = cv ? "rgba(22,163,74,0.85)" : "rgba(220,38,38,0.85)";
+          cPill.style.color = "#fff";
+          meta.appendChild(cPill);
         }
       }
 
@@ -2459,6 +2707,7 @@ window.addEventListener("message", event => {
           const _st = S();
           _st.paused = false;
           _st.stopped = false;
+          _st.endRow = false;
           _st.currentStepIndexForResume = index;
           currentStepIndexForResume = index;
           currentStepRunning = liveStep;
@@ -2467,10 +2716,20 @@ window.addEventListener("message", event => {
           const uiRow = getRowNumberFromUI() || 2;
           _st.currentRowRunning = uiRow;
 
-          setStatus("Run single step", "run");
-          await runSingleStep(liveStep, _st);
-          setStatus("Step done", "ok");
-          setLog("Done " + (liveStep.fieldId || ("Step " + (index + 1))));
+          if (String(liveStep.type || "").toLowerCase() === "condition") {
+            // Condition: chạy luồng THẬT từ step này, lặp đến khi TRUE thì DỪNG (chỉ test)
+            flushProxies();
+            setStatus("Test: chạy đến khi condition TRUE...", "run");
+            await runStepsFromIndex(index, _st, { stopOnCondTrue: true });
+            const passed = !!_st.lastConditionPassed;
+            setStatus("Condition = " + (passed ? "TRUE ✓ → dừng" : "FALSE ✗"), passed ? "ok" : "warn");
+            setLog("CONDITION test => " + (passed ? "TRUE (dừng tại đây)" : "FALSE"));
+          } else {
+            setStatus("Run single step", "run");
+            await runSingleStep(liveStep, _st);
+            setStatus("Step done", "ok");
+            setLog("Done " + (liveStep.fieldId || ("Step " + (index + 1))));
+          }
           currentStepRunning = null;
           renderSteps();
         } catch (err) {
@@ -2524,18 +2783,41 @@ window.addEventListener("message", event => {
         renderSteps();
       };
 
-      container.appendChild(row);
+      // Đưa row vào group container nếu step thuộc group
+      const gname = String(step.groupName || "").trim();
+      if (gname) {
+        if (gname !== curGroupName) startGroup(gname);
+        curGroupBody.appendChild(row);
+      } else {
+        curGroupName = null;
+        curGroupBody = null;
+        container.appendChild(row);
+      }
     });
+
+    // Render các group RỖNG (vừa Add Group, chưa có step) làm vùng kéo-thả
+    curGroupName = null; curGroupBody = null;
+    pendingEmptyGroups.forEach(name => {
+      const has = steps.some(s => s && String(s.groupName || "").trim() === name);
+      if (!has) startGroup(name);
+    });
+  }
+
+  // Cleanup: bỏ tên khỏi danh sách group rỗng khi đã có step
+  function clearPendingEmpty(name) {
+    pendingEmptyGroups = pendingEmptyGroups.filter(n => n !== name);
   }
 
   function makeMetaPill(label, value) {
     const el = document.createElement("div");
     el.textContent = label + ": " + value;
     Object.assign(el.style, {
-      padding: "2px 6px",
-      borderRadius: "999px",
-      border: "1px solid rgba(148,163,184,0.25)",
-      background: "rgba(2,6,23,0.7)",
+      padding: "1px 7px",
+      borderRadius: "6px",
+      border: "none",
+      background: "rgba(255,255,255,0.05)",
+      color: "#94a3b8",
+      fontSize: "10px",
       userSelect: "none"
     });
     return el;
@@ -2584,9 +2866,9 @@ window.addEventListener("message", event => {
     }
 
     if (type === "read") {
-      const key = (step.resultKey || step.fieldId || "").trim();
+      const key = (step.resultKey || "").trim();
       return "Read " + (step.readMode || "text") + " from " + (step.selector || "(none)") +
-        (key ? " -> var '" + key + "'" : "");
+        (key ? " -> var '" + key + "'" : " (value only)");
     }
 
     if (type === "download") {
@@ -2778,8 +3060,8 @@ window.addEventListener("message", event => {
 
     const conditionTrueModeSelect = makeSelect(
       [
-        { value: "stop", label: "Stop pattern (default)" },
-        { value: "jump", label: "Jump to step →" }
+        { value: "stop", label: "Stop pattern (when FALSE)" },
+        { value: "jump", label: "Jump to step (when FALSE) →" }
       ],
       step.conditionTrueMode || "stop",
       "100%"
@@ -2788,7 +3070,7 @@ window.addEventListener("message", event => {
 
     const conditionJumpToInput = makeSmallInput("text", step.conditionJumpTo || "", "100%");
     conditionJumpToInput.style.width = "100%";
-    conditionJumpToInput.placeholder = "Field ID of target step";
+    conditionJumpToInput.placeholder = "Số thứ tự step (vd: 2 hoặc #2)";
 
     const clickModeSelect = makeSelect(["selector", "point"], step.clickMode || "selector", "100%");
     clickModeSelect.style.width = "100%";
@@ -2871,6 +3153,7 @@ window.addEventListener("message", event => {
 
     const resultKeyInput = makeSmallInput("text", step.resultKey || "", "100%");
     resultKeyInput.style.width = "100%";
+    resultKeyInput.placeholder = "Tên biến lưu giá trị (vd: campaignName) — để trống nếu chỉ cần đọc";
 
     // --- Popup-specific fields ---
     const popupActionSelect = makeSelect(
@@ -2900,7 +3183,7 @@ window.addEventListener("message", event => {
 
     const noteInput = makeSmallTextarea(step.note || "", 3);
 
-    const fieldFieldId = makeInlineField("Field ID", fieldIdInput);
+    const fieldFieldId = makeInlineField("Step name", fieldIdInput);
     const fieldType = makeInlineField("Type", typeSelect);
     const fieldSelector = makeInlineField("Selector", selectorInput);
     const fieldColumn = makeInlineField("Column", columnInput);
@@ -2911,12 +3194,12 @@ window.addEventListener("message", event => {
     const fieldConditionOp = makeInlineField("Operator", conditionOpSelect);
     const fieldConditionValue = makeInlineField("Value (fixed)", conditionValueInput);
     const fieldCondition = makeInlineField("Expression", conditionExprInput);
-    const fieldConditionTrueMode = makeInlineField("If true →", conditionTrueModeSelect);
-    const fieldConditionJumpTo = makeInlineField("Jump to", conditionJumpToInput);
+    const fieldConditionTrueMode = makeInlineField("If FALSE →", conditionTrueModeSelect);
+    const fieldConditionJumpTo = makeInlineField("Jump to step #", conditionJumpToInput);
     const fieldSessionName = makeInlineField("Session name", sessionNameInput);
     const fieldSourceFieldId = makeInlineField("Source field ID", sourceFieldIdInput);
     const fieldReadMode = makeInlineField("Read mode", readModeSelect);
-    const fieldResultKey = makeInlineField("Result key", resultKeyInput);
+    const fieldResultKey = makeInlineField("Result key (Var)", resultKeyInput);
     const fieldClickMode = makeInlineField("Click mode", clickModeSelect);
     const fieldClicknearDirection = makeInlineField("Direction", clicknearDirectionSelect);
     const fieldClicknearIndex = makeInlineField("Btn index", clicknearIndexInput);
@@ -3057,7 +3340,7 @@ window.addEventListener("message", event => {
       setFieldVisible(fieldElementTextVar, hasElementTextSource);
       setFieldVisible(fieldContainerTag, hasSelectorType);
       setFieldVisible(fieldContainerClass, hasSelectorType);
-      setFieldVisible(fieldColumn, ["input", "open", "opentab", "upload", "read", "return"].includes(type));
+      setFieldVisible(fieldColumn, ["input", "open", "opentab", "upload", "return"].includes(type));
       setFieldVisible(fieldUrl, ["open", "opentab", "load-session"].includes(type));
       setFieldVisible(fieldValue, ["input", "open", "opentab", "download"].includes(type));
 
@@ -3084,6 +3367,13 @@ window.addEventListener("message", event => {
       setFieldVisible(fieldSourceFieldId, type === "read-input");
       setFieldVisible(fieldReadMode, type === "read");
       setFieldVisible(fieldResultKey, ["read", "return", "input", "condition"].includes(type));
+      if (type === "condition") {
+        fieldResultKey._setLabel("Check Var (result key)");
+        resultKeyInput.placeholder = "Tên biến cần kiểm tra (khớp Result key của step Read). Trống = dùng read gần nhất";
+      } else {
+        fieldResultKey._setLabel("Result key (Var)");
+        resultKeyInput.placeholder = "Tên biến lưu giá trị (vd: campaignName) — để trống nếu chỉ cần đọc";
+      }
       setFieldVisible(fieldClickMode, type === "click" || type === "cdpclick" || type === "hover");
       setFieldVisible(fieldClicknearDirection, type === "clicknear");
       setFieldVisible(fieldClicknearIndex, type === "clicknear");
@@ -3231,7 +3521,46 @@ window.addEventListener("message", event => {
 
     function close() {
       overlay.remove();
+      activeEditorCtx = null;
+      document.removeEventListener("keydown", editorKeydown, true);
     }
+
+    // Picker THẬT giống nút Pos/Sel (hiện overlay chọn trên slot)
+    function triggerPickSelector() {
+      try {
+        domExec({ type: "startPickSelector", stepId: steps[index] ? steps[index].id : step.id });
+        setStatus("Click element trên slot để lấy selector", "run");
+      } catch (e) { console.warn(e); }
+    }
+    function triggerPickPoint() {
+      try {
+        domExec({ type: "startPickPoint", stepId: steps[index] ? steps[index].id : step.id });
+        setStatus("Click trên slot để lấy toạ độ", "run");
+      } catch (e) { console.warn(e); }
+    }
+
+    // Phím tắt trong editor: S=selector, P=point (khi chưa focus ô); Ctrl+S=lưu; Esc=đóng
+    function editorKeydown(e) {
+      if ((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === "s") {
+        e.preventDefault(); e.stopPropagation(); saveBtn.click(); return;
+      }
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); return; }
+      const t = e.target;
+      const tag = t && t.tagName ? t.tagName.toLowerCase() : "";
+      const inField = tag === "input" || tag === "textarea" || tag === "select";
+      if (!inField) {
+        const k = String(e.key).toLowerCase();
+        if (k === "s") { e.preventDefault(); triggerPickSelector(); }
+        else if (k === "p") { e.preventDefault(); triggerPickPoint(); }
+      }
+    }
+
+    // Đăng ký context để picker cập nhật live vào editor
+    activeEditorCtx = {
+      stepId: steps[index] ? steps[index].id : step.id,
+      selectorInput, xInput, yInput, clickModeSelect
+    };
+    document.addEventListener("keydown", editorKeydown, true);
 
     closeBtn.onclick = close;
     cancelBtn.onclick = close;
@@ -3305,9 +3634,74 @@ window.addEventListener("message", event => {
 
       try {
         setStatus("Testing step...", "run");
-        await runSingleStep(tempStep);
-        setStatus("Test OK", "ok");
+        const _testType = String(tempStep.type || "").toLowerCase();
+        // Reset cờ stop để test luôn chạy (kể cả sau khi 1 condition trước đã stop)
+        S().stopped = false;
+
+        // ── Condition test = CHẠY THẬT từ step này (jump/stop hoạt động) ──
+        if (_testType === "condition") {
+          // Áp dụng config đang sửa vào step thật để runStepsFromIndex dùng đúng
+          steps[index] = tempStep;
+          if (typeof S().currentRowRunning !== "number" || S().currentRowRunning < 2) {
+            const base = (typeof S().startRow === "number" && S().startRow >= 2)
+              ? S().startRow : (getRowNumberFromUI() || 2);
+            S().currentRowRunning = base;
+          }
+          S().stopped = false;
+          S().endRow = false;
+          flushProxies();
+          try { renderSteps(); } catch (_) {}
+          setStatus("Test: chạy đến khi condition TRUE...", "run");
+          setLog("CONDITION test → chạy từ step '" + (tempStep.fieldId || index) + "' đến khi TRUE");
+          // Chạy luồng thật từ step này; CHỈ test → dừng khi TRUE (stopOnCondTrue)
+          await runStepsFromIndex(index, S(), { stopOnCondTrue: true });
+          const passed = !!S().lastConditionPassed;
+          const desc = S().lastConditionDesc || "";
+          setStatus("Condition = " + (passed ? "TRUE ✓ → dừng" : "FALSE ✗"), passed ? "ok" : "warn");
+          setLog("CONDITION test => " + (passed ? "TRUE (dừng tại đây)" : "FALSE") + " | " + desc);
+          lastConditionByStep[readKey(activeSlotId, steps[index])] = passed;
+          try { renderSteps(); } catch (_) {}
+          return;
+        }
+
+        // Các step khác: chạy đơn lẻ
+        await runSingleStep(tempStep, S(), { stepIndex: index });
+
+        // Với step read: hiện thẳng giá trị đọc được cho người dùng thấy
+        if (_testType === "read") {
+          const val = S().lastReadResult;
+          let msg;
+          if (val === "__NO_RESPONSE__") {
+            msg = "⚠ Trang web không phản hồi.\nSlot có đang mở đúng trang không? (mở slot + load trang trước khi test)";
+            setStatus("Read: no response from page", "error");
+          } else if (val === "" || val == null) {
+            msg = "(empty)\nKhông đọc được giá trị — selector có thể không trúng element, hoặc element rỗng.\nSelector: " + (tempStep.selector || "(none)");
+            setStatus("Read = (empty)", "warn");
+          } else {
+            msg = String(val);
+            setStatus("Read = " + msg.slice(0, 80), "ok");
+          }
+          setLog("READ test => " + msg.replace(/\n/g, " | "));
+          // Cập nhật pill value trên card của step này
+          if (val !== "__NO_RESPONSE__") {
+            lastReadByStep[readKey(activeSlotId, steps[index])] = val;
+            try { renderSteps(); } catch (_) {}
+          }
+          try { alert("Read value:\n\n" + msg); } catch (_) {}
+        } else {
+          setStatus("Test OK", "ok");
+        }
       } catch (err) {
+        // Condition FALSE với chế độ jump → throw __conditionJump (không phải lỗi)
+        if (err && err.__conditionJump === true) {
+          const desc = S().lastConditionDesc || "";
+          lastConditionByStep[readKey(activeSlotId, steps[index])] = false;
+          try { renderSteps(); } catch (_) {}
+          setStatus("Condition = FALSE ✗ → jump (đã xác định target)", "warn");
+          setLog("CONDITION test => FALSE → jump index " + err.jumpIndex + " | " + desc);
+          try { alert("Condition result:\n\n✗ FALSE → sẽ jump tới step (index " + err.jumpIndex + ")\n\n" + desc + "\n\n(Lưu ý: Test chỉ kiểm tra. Jump thực sự chỉ chạy khi Run cả pattern.)"); } catch (_) {}
+          return;
+        }
         console.warn("[DetectLab] test step error:", err);
         setStatus("Test failed", "error");
       }
@@ -3579,7 +3973,7 @@ window.addEventListener("message", event => {
   // (promise runSingleStep gốc có thể resolve muộn sau đó — ta bỏ qua.)
   const STEP_TIMEOUT_MS = 30000; // 30s
   const MAX_ROW_RETRIES = 3;     // số lần restart tối đa cho 1 row khi bị treo
-  function runStepWithTimeout(step, _st, ms) {
+  function runStepWithTimeout(step, _st, ms, opts) {
     return new Promise((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -3588,7 +3982,7 @@ window.addEventListener("message", event => {
         reject({ __stepTimeout: true });
       }, ms);
       Promise.resolve()
-        .then(() => runSingleStep(step, _st))
+        .then(() => runSingleStep(step, _st, opts))
         .then(v => {
           if (settled) return;
           settled = true;
@@ -3604,8 +3998,11 @@ window.addEventListener("message", event => {
     });
   }
 
-  async function runStepsFromIndex(fromIndex, slotSt) {
+  async function runStepsFromIndex(fromIndex, slotSt, runOpts) {
     const _st = slotSt || S();
+    // stopOnCondTrue: CHỈ dùng khi TEST condition (dừng khi condition TRUE).
+    // Run pattern thật KHÔNG truyền → condition TRUE sẽ chạy tiếp.
+    const stopOnCondTrue = !!(runOpts && runOpts.stopOnCondTrue);
     const _steps = _st.steps;
     if (!_steps || !_steps.length) {
       setStatus("No steps", "warn");
@@ -3628,7 +4025,13 @@ window.addEventListener("message", event => {
       if (_st === S()) { currentStepRunning = step; renderSteps(); }
 
       try {
-        await runStepWithTimeout(step, _st, STEP_TIMEOUT_MS);
+        // Condition có thể CHỜ (lặp đọc lại đến khi pass) → KHÔNG áp watchdog 30s,
+        // để nó tự chờ. Các step khác vẫn có watchdog chống treo.
+        if (step.type === "condition") {
+          await runSingleStep(step, _st, { stepIndex: i, stopOnCondTrue });
+        } else {
+          await runStepWithTimeout(step, _st, STEP_TIMEOUT_MS, { stepIndex: i });
+        }
       } catch (err) {
         // Step bị treo > 30s → restart row này TỪ ĐẦU (step 0)
         if (err && err.__stepTimeout === true) {
@@ -3691,10 +4094,11 @@ window.addEventListener("message", event => {
     return n;
   }
 
-  async function runSingleStep(step, slotSt) {
+  async function runSingleStep(step, slotSt, opts) {
     if (!step) return;
     if (step.enabled === false) return;
     // slotSt: state của slot đang chạy (cố định, không đổi khi switch tab)
+    // opts.stepIndex: vị trí step trong _st.steps (condition dùng để tìm step Read phía trước)
     const _st = slotSt || S();
     const _sid = _st.slotId;
     if (_st.stopped) return;
@@ -3884,9 +4288,8 @@ window.addEventListener("message", event => {
       if (!step.selector && !step.elementText && !step.labelText) {
         throw new Error("Read selector is empty");
       }
-      if (!step.column && !step.resultKey) {
-        throw new Error("Read step requires target column or result var");
-      }
+      // KHÔNG bắt buộc column / var nữa — chỉ cần đọc value trong vùng đó.
+      // Kết quả luôn được lưu vào _st.lastReadResult để condition kế tiếp dùng.
 
       let result = "";
       // Use the rich step payload (selector + labelText + elementText + x/y)
@@ -3908,29 +4311,30 @@ window.addEventListener("message", event => {
       if (result === "true") storedValue = true;
       else if (result === "false") storedValue = false;
 
-      const keyName = (step.resultKey || step.fieldId || "").trim();
+      // Var GẮN VÀO read = CHỈ Result key (không dùng Step name/Field ID làm var nữa)
+      const keyName = (step.resultKey || "").trim();
       if (keyName) {
         _dvars[keyName] = storedValue;
         _st.detectLabVars = _dvars;
         console.log("[DetectLab] s" + _sid + " READ stored var", keyName, "=", storedValue);
       }
 
-      if (step.column) {
-        setCellValueByColumn(row, step.column, storedValue);
-      }
+      // KHÔNG ghi vào column nữa — read chỉ lấy value, không đụng tới sheet data.
+      // (Tránh ảnh hưởng các step khác dùng cùng cột.)
 
       // Track the most recent read so the next condition step can compare
       // against it without the user having to specify a source by name.
       _st.lastReadResult = storedValue;
       _st.lastReadKey = keyName || "";
 
+      // Lưu để hiển thị value đọc được ngay trên card step (control)
+      lastReadByStep[readKey(_sid, step)] = storedValue;
+      if (_st === S()) { try { renderSteps(); } catch (_) {} }
+
       const shortRead = String(result || "").trim().slice(0, 120);
-      setLog(
-        "Row " + row + " • READ => " +
-        (keyName ? ("var " + keyName + (step.column ? ", col " + step.column : "")) : ("col " + step.column)) +
-        " = " + shortRead
-      );
-      console.log("[DetectLab] s" + _sid + " row", row, "save", step.column, "=", result);
+      const dest = keyName ? ("var " + keyName) : "(value only)";
+      setLog("Row " + row + " • READ => " + dest + " = " + shortRead);
+      console.log("[DetectLab] s" + _sid + " row", row, "READ value =", result);
     } else if (type === "wait") {
       await wait(delayMs);
     } else if (type === "end") {
@@ -4002,88 +4406,117 @@ window.addEventListener("message", event => {
       const op = String(step.conditionOp || "").trim();
       const valueColumn = String(step.conditionValueColumn || "").trim().toUpperCase();
       const expr = (step.conditionExpr || "").trim();
-      let passed = false;
-      let evalDescription = "";
 
-      if (op) {
-        // Operator mode:
-        //   left  = the most recent read step's result (auto-tracked in _st.lastReadResult)
-        //   right = ONE of { value column → cell for current row, value fixed }
-        // The user fills exactly one of value column / value fixed; if both are set,
-        // value column wins and a warning is logged.
-        const readVal = _st.lastReadResult;
-        const hasFixed = step.conditionValue != null && String(step.conditionValue).trim() !== "";
-        const hasColumn = !!valueColumn;
-
-        let rightVal, rightSource;
-        if (hasColumn && hasFixed) {
-          console.warn("[DetectLab] condition: both Value column and Value fixed are set — using Value column, ignoring Value fixed");
-          rightVal = getCellValueByColumn(rowObj, valueColumn);
-          rightSource = "cell[" + valueColumn + "]";
-        } else if (hasColumn) {
-          rightVal = getCellValueByColumn(rowObj, valueColumn);
-          rightSource = "cell[" + valueColumn + "]";
-        } else if (hasFixed) {
-          rightVal = resolveFixedValue(step.conditionValue);
-          rightSource = "fixed";
-        } else {
-          rightVal = "";
-          rightSource = "(none)";
+      // Tìm step READ ngay trước condition này (để ĐỌC LẠI khi retry).
+      const myIdx = (opts && typeof opts.stepIndex === "number")
+        ? opts.stepIndex
+        : (Array.isArray(_st.steps) ? _st.steps.findIndex(s => s && s.id === step.id) : -1);
+      let precedingRead = null;
+      if (Array.isArray(_st.steps) && myIdx > 0) {
+        for (let k = myIdx - 1; k >= 0; k--) {
+          const s = _st.steps[k];
+          if (s && s.type === "read" && s.enabled !== false) { precedingRead = s; break; }
         }
-
-        if (readVal === undefined) {
-          console.warn("[DetectLab] condition: no prior read step result — left side is empty");
-        }
-
-        passed = evalConditionOp(op, readVal, rightVal);
-        evalDescription =
-          "read(" + (_st.lastReadKey || "?") + ")=" + JSON.stringify(readVal) +
-          " " + op + " " +
-          rightSource + "=" + JSON.stringify(rightVal);
-        console.log(
-          "[DetectLab] condition trace",
-          "\n  last read key:", _st.lastReadKey || "(none)",
-          "\n  last read result:", readVal, "(" + typeof readVal + ")",
-          "\n  right source:", rightSource,
-          "\n  right value:", rightVal, "(" + typeof rightVal + ")",
-          "\n  op:", op,
-          "\n  passed:", passed,
-          "\n  vars snapshot:", JSON.parse(JSON.stringify(_dvars))
-        );
-      } else if (expr) {
-        // No operator: free-form JS expression mode
-        const ctx = { row, rowData: rowObj, vars: _dvars };
-        try {
-          const fn = new Function("ctx", "with(ctx){ return (" + expr + "); }");
-          passed = !!fn(ctx);
-        } catch (err) {
-          passed = false;
-          console.warn("[DetectLab] condition eval error:", err, expr);
-        }
-        console.log("[DetectLab] condition expr →", expr, "| passed:", passed, "| vars:", JSON.parse(JSON.stringify(_dvars)));
-        evalDescription = expr;
-      } else {
-        setLog("Condition empty – treated as false (no jump/stop)");
-        evalDescription = "(empty)";
       }
 
-      setLog("Condition " + (passed ? "✓ TRUE" : "✗ false") + ": " + evalDescription);
+      // Vế trái: ưu tiên biến theo Check Var (result key) của condition,
+      // nếu trống thì dùng kết quả read gần nhất.
+      const checkVar = String(step.resultKey || "").trim();
+      const getLeftValue = () => {
+        if (checkVar) {
+          return (_dvars && Object.prototype.hasOwnProperty.call(_dvars, checkVar))
+            ? _dvars[checkVar]
+            : undefined;
+        }
+        return _st.lastReadResult;
+      };
+      const leftLabel = checkVar ? ("var[" + checkVar + "]") : ("read(" + (_st.lastReadKey || "?") + ")");
 
-      // Action fires when the condition is TRUE (flipped from old "fail" semantics)
-      if (passed) {
-        const trueMode = (step.conditionTrueMode || "stop").toLowerCase();
-        const jumpTo = String(step.conditionJumpTo || "").trim();
-
-        if (trueMode === "jump" && jumpTo) {
-          const _steps = _st.steps;
-          const jumpIndex = _steps.findIndex(s => s && String(s.fieldId || "").trim() === jumpTo);
-          if (jumpIndex < 0) {
-            throw new Error("Condition jump: step '" + jumpTo + "' not found");
+      // Tính 1 lần điều kiện
+      const evaluateOnce = () => {
+        let passed = false;
+        let evalDescription = "";
+        if (op) {
+          const readVal = getLeftValue();
+          const hasFixed = step.conditionValue != null && String(step.conditionValue).trim() !== "";
+          const hasColumn = !!valueColumn;
+          let rightVal, rightSource;
+          if (hasColumn) {
+            rightVal = getCellValueByColumn(rowObj, valueColumn);
+            rightSource = "cell[" + valueColumn + "]";
+          } else if (hasFixed) {
+            rightVal = resolveFixedValue(step.conditionValue);
+            rightSource = "fixed";
+          } else {
+            rightVal = ""; rightSource = "(none)";
           }
-          setLog("Condition TRUE → jump to step '" + jumpTo + "' (index " + jumpIndex + ")");
+          passed = evalConditionOp(op, readVal, rightVal);
+          evalDescription =
+            leftLabel + "=" + JSON.stringify(readVal) +
+            " " + op + " " + rightSource + "=" + JSON.stringify(rightVal);
+        } else if (expr) {
+          const ctx = { row, rowData: rowObj, vars: _dvars };
+          try {
+            const fn = new Function("ctx", "with(ctx){ return (" + expr + "); }");
+            passed = !!fn(ctx);
+          } catch (err) {
+            passed = false;
+            console.warn("[DetectLab] condition eval error:", err, expr);
+          }
+          evalDescription = expr;
+        } else {
+          evalDescription = "(empty)";
+        }
+        return { passed, evalDescription };
+      };
+
+      // Đánh giá 1 lần. Hành động kích hoạt khi điều kiện FALSE:
+      //   - jump: nhảy tới step chỉ định (tạo vòng lặp do user điều khiển)
+      //   - stop: dừng pattern ở row này
+      // Khi TRUE → chạy tiếp bình thường (sang step kế).
+      const { passed, evalDescription } = evaluateOnce();
+      _st.lastConditionPassed = passed;
+      _st.lastConditionDesc = evalDescription;
+      lastConditionByStep[readKey(_sid, step)] = passed;
+      if (_st === S()) { try { renderSteps(); } catch (_) {} }
+      setLog("Condition " + (passed ? "✓ TRUE" : "✗ FALSE") + ": " + evalDescription);
+
+      // CHỈ chế độ TEST (opts.stopOnCondTrue): TRUE thì DỪNG, không chạy step sau.
+      // Run pattern thật KHÔNG có cờ này → TRUE sẽ CHẠY TIẾP step kế.
+      if (passed && opts && opts.stopOnCondTrue) {
+        setLog("Test: Condition TRUE → dừng (không chạy các step sau)");
+        _st.stopped = true;
+        _st.endRow = false;
+        return;
+      }
+
+      if (!passed) {
+        const mode = (step.conditionTrueMode || "stop").toLowerCase();
+        const jumpTo = String(step.conditionJumpTo || "").trim();
+        if (mode === "jump") {
+          if (!jumpTo) {
+            setLog("⚠ Condition FALSE nhưng chưa chọn step để jump (ô 'Jump to' trống) → bỏ qua");
+            return;
+          }
+          const _steps = _st.steps;
+          let jumpIndex = -1;
+          // Ưu tiên: SỐ THỨ TỰ step (vd "#2" hoặc "2") → step thứ 2 (1-based)
+          const numStr = jumpTo.replace(/^#/, "").trim();
+          if (/^\d+$/.test(numStr)) {
+            jumpIndex = parseInt(numStr, 10) - 1; // 1-based → 0-based
+          } else {
+            // Fallback: khớp theo Step name (không phân biệt hoa thường) hoặc id
+            const jt = jumpTo.toLowerCase();
+            jumpIndex = _steps.findIndex(s => s && String(s.fieldId || "").trim().toLowerCase() === jt);
+            if (jumpIndex < 0) jumpIndex = _steps.findIndex(s => s && String(s.id || "").trim() === jumpTo);
+          }
+          if (jumpIndex < 0 || jumpIndex >= _steps.length) {
+            throw new Error("Condition jump: step '" + jumpTo + "' không hợp lệ (chỉ có " + _steps.length + " step)");
+          }
+          setLog("Condition FALSE → jump to step '" + jumpTo + "' (index " + jumpIndex + ")");
           throw { __conditionJump: true, jumpIndex };
         } else {
-          setLog("Condition TRUE → stop pattern (row " + row + ")");
+          setLog("Condition FALSE → stop pattern (row " + row + ")");
           _st.endRow = true;
           _st.stopped = true;
         }
@@ -4618,6 +5051,324 @@ window.addEventListener("message", event => {
   }
 
   // =========================================================
+  // =========================================================
+  // Groups panel — lưu nhóm step tái sử dụng (dùng chung mọi slot)
+  // =========================================================
+  function loadGroups() {
+    groups = loadJsonFromStorage(STORAGE_KEYS().GROUPS, {}) || {};
+    return groups;
+  }
+  function saveGroups() {
+    saveJsonToStorage(STORAGE_KEYS().GROUPS, groups);
+  }
+
+  let groupsListEl = null;
+
+  function buildGroupsPanel(panel) {
+    panel.innerHTML = "";
+    loadGroups();
+
+    const header = makeSectionCard();
+    header.textContent = "Groups — nhóm step tái sử dụng";
+    header.style.fontWeight = "700";
+
+    const actions = makeSectionCard();
+    Object.assign(actions.style, { display: "flex", gap: "6px", flexWrap: "wrap" });
+
+    const saveSelBtn = makeBtn("Lưu step đã chọn → group", "linear-gradient(90deg,#22c55e,#16a34a)", "#052e16");
+    const combineBtn = makeBtn("Combine groups đã chọn", "linear-gradient(90deg,#a855f7,#6366f1)", "#e5e7eb");
+    const refreshBtn = makeBtn("Refresh", "linear-gradient(90deg,#38bdf8,#2563eb)", "#020617");
+
+    actions.appendChild(saveSelBtn);
+    actions.appendChild(combineBtn);
+    actions.appendChild(refreshBtn);
+
+    const list = makeSectionCard();
+    list.id = "dlgroupslist";
+    Object.assign(list.style, { flex: "1", minHeight: "140px", overflowY: "auto" });
+    groupsListEl = list;
+
+    panel.appendChild(header);
+    panel.appendChild(actions);
+    panel.appendChild(list);
+
+    saveSelBtn.onclick = () => saveSelectedStepsAsGroup();
+    combineBtn.onclick = () => combineSelectedGroups();
+    refreshBtn.onclick = () => { loadGroups(); renderGroupsPanel(); };
+
+    renderGroupsPanel();
+  }
+
+  async function saveSelectedStepsAsGroup() {
+    const chosen = (steps || []).filter(s => s && selectedStepIds.has(s.id));
+    if (!chosen.length) {
+      alert("Chưa chọn step nào. Tick chọn các step ở tab Steps trước.");
+      return;
+    }
+    const name = await showPromptModal("Tên group:", "");
+    if (!name || !name.trim()) return;
+    const key = name.trim();
+    loadGroups();
+    groups[key] = {
+      name: key,
+      steps: deepClone(chosen).map(s => { delete s.__testStopOnTrue; delete s.groupName; return s; }),
+      ts: new Date().toLocaleString()
+    };
+    saveGroups();
+    // Gắn groupName vào CHÍNH các step trong danh sách → chúng gom thành block group
+    (steps || []).forEach(s => { if (s && selectedStepIds.has(s.id)) s.groupName = key; });
+    selectedStepIds.clear();
+    flushProxies();
+    renderSteps();
+    renderGroupsPanel();
+    setLog("Đã gộp " + chosen.length + " step thành group '" + key + "'");
+  }
+
+  // Lưu 1 group đang có trong danh sách Steps (theo groupName) vào thư viện Groups
+  function saveInlineGroupToLibrary(name) {
+    const chosen = (steps || []).filter(s => s && String(s.groupName || "").trim() === name);
+    if (!chosen.length) return;
+    loadGroups();
+    groups[name] = {
+      name: name,
+      steps: deepClone(chosen).map(s => { delete s.__testStopOnTrue; delete s.groupName; return s; }),
+      ts: new Date().toLocaleString()
+    };
+    saveGroups();
+    renderGroupsPanel();
+    setLog("Đã lưu group '" + name + "' vào thư viện (" + chosen.length + " step)");
+  }
+
+  async function combineSelectedGroups() {
+    const names = Array.from(selectedGroupNames).filter(n => groups[n]);
+    if (names.length < 2) {
+      alert("Tick chọn ít nhất 2 group để combine.");
+      return;
+    }
+    const name = await showPromptModal("Tên group gộp:", names.join(" + "));
+    if (!name || !name.trim()) return;
+    const key = name.trim();
+    const merged = [];
+    names.forEach(n => {
+      const g = groups[n];
+      if (g && Array.isArray(g.steps)) merged.push(...deepClone(g.steps));
+    });
+    groups[key] = { name: key, steps: merged, ts: new Date().toLocaleString() };
+    saveGroups();
+    selectedGroupNames.clear();
+    renderGroupsPanel();
+    setLog("Đã combine " + names.length + " group → '" + key + "' (" + merged.length + " step)");
+  }
+
+  function insertGroupIntoSteps(name) {
+    const g = groups[name];
+    if (!g || !Array.isArray(g.steps) || !g.steps.length) {
+      alert("Group rỗng.");
+      return;
+    }
+    // Clone + cấp id mới để không trùng; gắn groupName để gom thành block trong Steps
+    const cloned = deepClone(g.steps).map(s => {
+      s.id = uid("step");
+      delete s.__testStopOnTrue;
+      s.groupName = name;
+      return s;
+    });
+    if (!Array.isArray(steps)) steps = [];
+    steps.push(...cloned);
+    normalizeAllSteps();
+    flushProxies();
+    renderSteps();
+    setLog("Đã đẩy group '" + name + "' (" + cloned.length + " step) vào pattern");
+  }
+
+  function renderGroupsPanel() {
+    if (!groupsListEl) return;
+    loadGroups();
+    const list = groupsListEl;
+    list.innerHTML = "";
+    const names = Object.keys(groups || {});
+    if (!names.length) {
+      const empty = document.createElement("div");
+      empty.textContent = "Chưa có group nào. Tick chọn step ở tab Steps rồi bấm 'Lưu step đã chọn → group'.";
+      empty.style.fontSize = "12px";
+      empty.style.color = "#9ca3af";
+      list.appendChild(empty);
+      return;
+    }
+    names.forEach(name => {
+      const g = groups[name] || {};
+      const cnt = Array.isArray(g.steps) ? g.steps.length : 0;
+      const row = document.createElement("div");
+      Object.assign(row.style, {
+        padding: "8px", marginBottom: "6px", borderRadius: "8px",
+        background: "rgba(2,6,23,0.7)", border: "1px solid rgba(99,102,241,0.5)"
+      });
+
+      const top = document.createElement("div");
+      Object.assign(top.style, { display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px" });
+
+      const chk = document.createElement("input");
+      chk.type = "checkbox";
+      chk.checked = selectedGroupNames.has(name);
+      chk.onchange = () => { if (chk.checked) selectedGroupNames.add(name); else selectedGroupNames.delete(name); };
+
+      const title = document.createElement("span");
+      title.textContent = name + "  (" + cnt + " step)";
+      Object.assign(title.style, { fontSize: "13px", fontWeight: "700", color: "#e5e7eb", flex: "1" });
+
+      const ts = document.createElement("span");
+      ts.textContent = g.ts || "";
+      Object.assign(ts.style, { fontSize: "10px", color: "#94a3b8" });
+
+      top.appendChild(chk);
+      top.appendChild(title);
+      top.appendChild(ts);
+
+      const btns = document.createElement("div");
+      Object.assign(btns.style, { display: "flex", gap: "6px", flexWrap: "wrap" });
+
+      const insBtn = makeBtn("Đẩy vào pattern", "linear-gradient(90deg,#22c55e,#16a34a)", "#052e16");
+      const renBtn = makeBtn("Rename", "linear-gradient(90deg,#e5e7eb,#94a3b8)", "#020617");
+      const delBtn = makeBtn("Xóa", "linear-gradient(90deg,#f87171,#dc2626)", "#fff");
+      [insBtn, renBtn, delBtn].forEach(b => { b.style.fontSize = "11px"; b.style.padding = "3px 8px"; });
+
+      insBtn.onclick = () => insertGroupIntoSteps(name);
+      renBtn.onclick = async () => {
+        const nn = await showPromptModal("Đổi tên group:", name);
+        if (!nn || !nn.trim() || nn.trim() === name) return;
+        groups[nn.trim()] = groups[name];
+        groups[nn.trim()].name = nn.trim();
+        delete groups[name];
+        saveGroups();
+        renderGroupsPanel();
+      };
+      delBtn.onclick = () => {
+        if (!confirm("Xóa group '" + name + "'?")) return;
+        delete groups[name];
+        selectedGroupNames.delete(name);
+        saveGroups();
+        renderGroupsPanel();
+      };
+
+      btns.appendChild(insBtn);
+      btns.appendChild(renBtn);
+      btns.appendChild(delBtn);
+
+      row.appendChild(top);
+      row.appendChild(btns);
+      list.appendChild(row);
+    });
+  }
+
+  // =========================================================
+  // Quick step builder (Feature 2) — phím tắt: thêm step + mở editor THẬT
+  // =========================================================
+  async function quickAddStep(stepType) {
+    const sid = activeSlotId;
+    setStatus("Step " + stepType + " — nhập trên cửa sổ slot " + sid + " (S/P pick, Ctrl+S lưu)", "run");
+    const res = await domShowStepBuilder(stepType, sid);
+    if (!res || !res.ok) {
+      if (res && res.noResponse) {
+        setStatus("Slot " + sid + " chưa mở / sai trang", "error");
+        alert("Slot " + sid + " chưa mở hoặc chưa load trang. Mở slot rồi thử lại.");
+      } else {
+        setStatus("Hủy thêm step", null);
+      }
+      return;
+    }
+    const step = buildStepFromBuilderFields(stepType, res.fields || {}, (Array.isArray(steps) ? steps.length : 0) + 1);
+    if (!Array.isArray(steps)) steps = [];
+    steps.push(step);
+    normalizeAllSteps();
+    flushProxies();
+    renderSteps();
+    setStatus("Đã thêm step " + stepType + " (nhập trên slot)", "ok");
+    setLog("Đã thêm '" + stepType + "' qua slot overlay");
+  }
+
+  // Build step object từ field của overlay builder
+  function buildStepFromBuilderFields(stepType, f, idx) {
+    f = f || {};
+    const base = createDefaultStep(idx || 1);
+    const step = Object.assign({}, base, { type: stepType, action: stepType });
+    if (f.selector != null) step.selector = String(f.selector || "").trim();
+    if (f.column != null) step.column = String(f.column || "").trim().toUpperCase();
+    if (f.fileNameColumn != null) step.fileNameColumn = String(f.fileNameColumn || "").trim().toUpperCase();
+    if (f.value != null) step.value = String(f.value || "");
+    if (f.url != null) step.url = String(f.url || "").trim();
+    if (f.resultKey != null) step.resultKey = String(f.resultKey || "").trim();
+    if (f.op != null) step.conditionOp = String(f.op || "").trim();
+    if (f.conditionValueColumn != null) step.conditionValueColumn = String(f.conditionValueColumn || "").trim().toUpperCase();
+    if (f.conditionValue != null) step.conditionValue = String(f.conditionValue || "");
+    if (f.conditionTrueMode != null) step.conditionTrueMode = String(f.conditionTrueMode || "stop");
+    if (f.conditionJumpTo != null) step.conditionJumpTo = String(f.conditionJumpTo || "").trim();
+    if (f.readMode != null && f.readMode) step.readMode = String(f.readMode);
+    if (f.matchText != null) step.matchText = String(f.matchText || "").trim();
+    if (f.key != null) step.key = String(f.key || "").trim();
+    if (f.sessionName != null) step.sessionName = String(f.sessionName || "").trim();
+    if (f.clicknearDirection != null && f.clicknearDirection) step.clicknearDirection = String(f.clicknearDirection);
+    if (f.clicknearIndex != null && f.clicknearIndex !== "") step.clicknearIndex = parseInt(f.clicknearIndex, 10) || 0;
+    if (f.arrowDirection != null && f.arrowDirection) step.arrowDirection = String(f.arrowDirection);
+    if (f.arrowCount != null && f.arrowCount !== "") step.arrowCount = parseInt(f.arrowCount, 10) || 1;
+    if (f.arrowDelay != null && f.arrowDelay !== "") step.arrowDelay = parseInt(f.arrowDelay, 10) || 50;
+    // Thông tin element phong phú (từ pick selector)
+    if (f.labelText != null) step.labelText = String(f.labelText || "").trim();
+    if (f.elementText != null) step.elementText = String(f.elementText || "").trim();
+    if (f.containerTag != null) step.containerTag = String(f.containerTag || "").trim();
+    if (f.containerClassName != null) step.containerClassName = String(f.containerClassName || "").trim();
+    const d = parseInt(f.delay, 10);
+    if (!isNaN(d)) step.delayMs = d;
+    // clickMode: ưu tiên giá trị chọn trong overlay; nếu có x/y mà chọn point
+    if (f.clickMode != null && f.clickMode) step.clickMode = String(f.clickMode);
+    if (f.x != null && f.x !== "" && f.y != null && f.y !== "") {
+      step.x = Number(f.x); step.y = Number(f.y);
+    }
+    return step;
+  }
+
+  // Overlay nhập step bấm TRÊN cửa sổ slot → control GHI NHẬN vào đúng slot đó
+  safeOnWebResult(data => {
+    if (!data || data.type !== "stepBuilder" || !data.fromSlot || data.ack || !data.ok) return;
+    const sid = Number(data.slotId) || activeSlotId;
+    const st = slotStates[sid];
+    if (!st) return;
+    if (!Array.isArray(st.steps)) st.steps = [];
+    const step = buildStepFromBuilderFields(data.stepType, data.fields || {}, st.steps.length + 1);
+    st.steps.push(step);
+    if (sid === activeSlotId) {
+      syncProxies();
+      normalizeAllSteps();
+      flushProxies();
+      renderSteps();
+    }
+    setStatus("Đã ghi nhận step '" + data.stepType + "' từ slot " + sid, "ok");
+    setLog("Slot " + sid + " (overlay) thêm: " + data.stepType);
+  });
+
+  // Phím tắt chọn loại step (khi KHÔNG đang gõ trong ô input)
+  const QUICK_STEP_KEYS = {
+    c: "click", h: "hover", i: "input", r: "read", k: "condition",
+    u: "upload", d: "download", o: "open", w: "wait", e: "end", x: "delete"
+  };
+  let quickKeysEnabled = true;
+  window.__dlSetQuickKeys = (on) => { quickKeysEnabled = !!on; };
+
+  document.addEventListener("keydown", (ev) => {
+    if (!quickKeysEnabled) return;
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    const t = ev.target;
+    const tag = t && t.tagName ? t.tagName.toLowerCase() : "";
+    if (tag === "input" || tag === "textarea" || tag === "select" || (t && t.isContentEditable)) return;
+    // chỉ khi đang ở tab Steps
+    const panelStepsEl = document.getElementById("dlpanelsteps");
+    if (panelStepsEl && panelStepsEl.style.display === "none") return;
+    const key = String(ev.key || "").toLowerCase();
+    if (QUICK_STEP_KEYS[key]) {
+      ev.preventDefault();
+      quickAddStep(QUICK_STEP_KEYS[key]);
+    }
+  });
+
   // Images panel
   // =========================================================
 
@@ -5540,6 +6291,50 @@ async function addManualMediaItems() {
     title.textContent = "Session & Cookies";
     Object.assign(title.style, { fontWeight: "700", fontSize: "13px", color: "#e2e8f0" });
     container.appendChild(title);
+
+    // ── Bảng phím tắt set-up pattern nhanh ──
+    const kbCard = makeSectionCard();
+    Object.assign(kbCard.style, { display: "flex", flexDirection: "column", gap: "6px" });
+    const kbTitle = document.createElement("div");
+    kbTitle.textContent = "⌨ Phím tắt set-up pattern (nhập ngay trên slot)";
+    Object.assign(kbTitle.style, { fontWeight: "600", fontSize: "12px", color: "#60a5fa" });
+    kbCard.appendChild(kbTitle);
+
+    const kbFlow = document.createElement("div");
+    kbFlow.style.fontSize = "11px";
+    kbFlow.style.color = "#cbd5e1";
+    kbFlow.innerHTML =
+      "<b>Bật trên cửa sổ slot:</b> <code>Ctrl+Shift+B</code> (badge xanh hiện góc dưới).<br>" +
+      "<b>Flow:</b> bấm phím loại step → overlay hiện trên slot → <code>S</code> chọn selector / <code>P</code> chọn điểm → gõ value → <code>Ctrl+S</code> lưu → bấm phím tiếp.";
+    kbCard.appendChild(kbFlow);
+
+    const kbRules = [
+      ["C", "click"], ["I", "input"], ["R", "read"], ["K", "condition"],
+      ["H", "hover"], ["U", "upload"], ["D", "download"], ["O", "open"],
+      ["W", "wait"], ["E", "end"], ["X", "delete"]
+    ];
+    const kbGrid = document.createElement("div");
+    Object.assign(kbGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "4px", marginTop: "2px" });
+    kbRules.forEach(([k, name]) => {
+      const cell = document.createElement("div");
+      Object.assign(cell.style, { fontSize: "11px", color: "#e5e7eb", display: "flex", gap: "6px", alignItems: "center" });
+      const kbd = document.createElement("span");
+      kbd.textContent = k;
+      Object.assign(kbd.style, { display: "inline-block", minWidth: "18px", textAlign: "center", padding: "1px 5px", borderRadius: "4px", background: "rgba(255,255,255,0.1)", fontWeight: "700", fontFamily: "monospace" });
+      const lbl = document.createElement("span"); lbl.textContent = name; lbl.style.color = "#9ca3af";
+      cell.appendChild(kbd); cell.appendChild(lbl);
+      kbGrid.appendChild(cell);
+    });
+    kbCard.appendChild(kbGrid);
+
+    const kbInOverlay = document.createElement("div");
+    kbInOverlay.style.fontSize = "11px";
+    kbInOverlay.style.color = "#94a3b8";
+    kbInOverlay.style.marginTop = "4px";
+    kbInOverlay.innerHTML = "Trong overlay: <code>S</code> selector · <code>P</code> point · <code>Ctrl+S</code> lưu · <code>Esc</code> hủy";
+    kbCard.appendChild(kbInOverlay);
+
+    container.appendChild(kbCard);
 
     // ── Clear cookies của slot hiện tại ──
     const clearCard = makeSectionCard();

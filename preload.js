@@ -99,6 +99,8 @@ safeInvoke("media:download-from-sheet", payload || {}),
   // ── Preview / always-on-top ──
   setControlAlwaysOnTop: flag =>
     safeInvoke("control:set-always-on-top", { flag: !!flag }),
+  focusControl: () =>
+    safeInvoke("control:focus", {}),
   openPreviewWindow: () =>
     safeInvoke("preview:open-window", {}),
   closePreviewWindow: () =>

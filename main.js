@@ -620,14 +620,12 @@ function createControlWindow() {
   controlWin = new BrowserWindow({
     width: DEFAULT_CONTROL_BOUNDS.width,
     height: DEFAULT_CONTROL_BOUNDS.height,
-    autoHideMenuBar: true,    // ẩn thanh menu File/Edit (Alt để hiện tạm)
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       nodeIntegration: false,
       contextIsolation: true
     }
   });
-  controlWin.setMenuBarVisibility(false);
 
   controlWin.loadFile(path.join(__dirname, "control", "index.html"));
 
@@ -719,6 +717,16 @@ ipcMain.handle("control:set-always-on-top", async (_event, payload) => {
   return { ok: true, flag };
 });
 
+// IPC: đưa cửa sổ control lên trước (để thấy editor khi bấm phím tắt trên slot)
+ipcMain.handle("control:focus", async () => {
+  if (controlWin && !controlWin.isDestroyed()) {
+    try { if (controlWin.isMinimized()) controlWin.restore(); } catch (_) {}
+    controlWin.show();
+    controlWin.focus();
+  }
+  return { ok: true };
+});
+
 // IPC: mở (hoặc focus) cửa sổ preview nổi
 ipcMain.handle("preview:open-window", async () => {
   createPreviewWindow();
@@ -789,7 +797,6 @@ function createWebWindowForSlot(slotId) {
     height: DEFAULT_WEB_BOUNDS.height,
     x: xOffset,
     title: `DetectLab Web — Slot ${id}`,
-    autoHideMenuBar: true, // ẩn thanh menu File/Edit
     webPreferences: {
       preload: path.join(__dirname, "preload-web.js"),
       nodeIntegration: false,
@@ -1019,9 +1026,12 @@ ipcMain.handle("slot:set-visible", async (_event, { slotId, visible }) => {
   if (visible) {
     // Restore về vị trí thật
     const xOffset = SLOT_X_OFFSET[(slotId - 1)] || (1000 + (slotId - 1) * 220);
+    try { if (win.isMinimized()) win.restore(); } catch (_) {}
     win.setPosition(xOffset, 0);
     win.setOpacity(1);
-    win.showInactive();
+    win.setBounds({ x: xOffset, y: 0, width: DEFAULT_WEB_BOUNDS.width, height: DEFAULT_WEB_BOUNDS.height });
+    win.show();
+    win.focus();
   } else {
     // Move ra ngoài màn hình THAY VÌ hide()
     // hide() suspend Chromium rendering → scroll/elementFromPoint/inject JS không chạy được
