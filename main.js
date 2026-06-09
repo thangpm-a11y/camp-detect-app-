@@ -3,6 +3,174 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const fetch = require("node-fetch");
+const chromePool = require("./chrome-pool");
+
+// Identity hiện tại của mỗi slot (để burn khi gặp captcha)
+// slotId → { domain, identityId }
+const slotIdentity = new Map();
+// Chống reset chồng nhau: slotId → true khi đang reset
+const slotResetting = new Set();
+// Cấu hình captcha auto-reset toàn cục
+const captchaConfig = {
+  enabled: true,
+  autoReset: true,
+  autoHarvestOnEmpty: true,
+  cooldownMs: 12000,
+  harvestWaitMs: 8000,
+  // pattern tuỳ chỉnh (ngoài default trong preload-web)
+  customTextPatterns: [],
+  customSrcPatterns: [],
+  customUrlPatterns: [],
+};
+
+function captchaConfigPath() {
+  return path.join(app.getPath("userData"), "captcha.json");
+}
+function loadCaptchaConfig() {
+  try {
+    const p = captchaConfigPath();
+    if (!fs.existsSync(p)) return;
+    const j = JSON.parse(fs.readFileSync(p, "utf8")) || {};
+    for (const k of ["enabled", "autoReset", "autoHarvestOnEmpty"]) {
+      if (typeof j[k] === "boolean") captchaConfig[k] = j[k];
+    }
+    for (const k of ["cooldownMs", "harvestWaitMs"]) {
+      if (Number.isFinite(j[k])) captchaConfig[k] = j[k];
+    }
+    if (Array.isArray(j.customTextPatterns)) captchaConfig.customTextPatterns = j.customTextPatterns.map(String);
+    if (Array.isArray(j.customSrcPatterns)) captchaConfig.customSrcPatterns = j.customSrcPatterns.map(String);
+    if (Array.isArray(j.customUrlPatterns)) captchaConfig.customUrlPatterns = j.customUrlPatterns.map(String);
+  } catch (err) { console.warn("[MAIN] loadCaptchaConfig error:", err && err.message); }
+}
+function saveCaptchaConfig() {
+  try { fs.writeFileSync(captchaConfigPath(), JSON.stringify(captchaConfig, null, 2), "utf8"); }
+  catch (err) { console.warn("[MAIN] saveCaptchaConfig error:", err && err.message); }
+}
+// Cấu hình đẩy xuống renderer (enabled/cooldown + pattern custom để merge)
+function buildRendererCaptchaCfg() {
+  return {
+    enabled: captchaConfig.enabled,
+    cooldownMs: captchaConfig.cooldownMs,
+    textPatterns: captchaConfig.customTextPatterns,
+    srcPatterns: captchaConfig.customSrcPatterns,
+    urlPatterns: captchaConfig.customUrlPatterns,
+  };
+}
+
+// ── Anti-detect: chặn rò rỉ IP thật qua WebRTC khi dùng proxy ────────────────
+// Phải gọi TRƯỚC app ready.
+try {
+  app.commandLine.appendSwitch("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
+  app.commandLine.appendSwitch("webrtc-ip-handling-policy", "disable_non_proxied_udp");
+  app.commandLine.appendSwitch("disable-features", "WebRtcHideLocalIpsWithMdns");
+} catch (_) {}
+
+// ── Proxy state (IP riêng mỗi slot + xoay vòng) ──────────────────────────────
+// slots: Map<slotId, parsedProxy>; pool: parsedProxy[]; rotateOnReset; poolIdx
+const proxyState = {
+  slots: new Map(),
+  pool: [],
+  rotateOnReset: true,
+  poolIdx: 0,
+};
+
+function proxyConfigPath() {
+  return path.join(app.getPath("userData"), "proxies.json");
+}
+
+function loadProxyConfig() {
+  try {
+    const p = proxyConfigPath();
+    if (!fs.existsSync(p)) return;
+    const j = JSON.parse(fs.readFileSync(p, "utf8")) || {};
+    proxyState.rotateOnReset = j.rotateOnReset !== false;
+    proxyState.pool = (Array.isArray(j.pool) ? j.pool : [])
+      .map((s) => chromePool.parseProxy(s)).filter(Boolean);
+    proxyState._poolRaw = Array.isArray(j.pool) ? j.pool : [];
+    proxyState.slots.clear();
+    if (j.slots && typeof j.slots === "object") {
+      for (const k of Object.keys(j.slots)) {
+        const px = chromePool.parseProxy(j.slots[k]);
+        if (px) { px._raw = j.slots[k]; proxyState.slots.set(Number(k), px); }
+      }
+    }
+  } catch (err) { console.warn("[MAIN] loadProxyConfig error:", err && err.message); }
+}
+
+function saveProxyConfig() {
+  try {
+    const slots = {};
+    for (const [id, px] of proxyState.slots) slots[id] = px._raw || px.server;
+    const out = {
+      rotateOnReset: proxyState.rotateOnReset,
+      pool: proxyState._poolRaw || proxyState.pool.map((p) => p.server),
+      slots,
+    };
+    fs.writeFileSync(proxyConfigPath(), JSON.stringify(out, null, 2), "utf8");
+  } catch (err) { console.warn("[MAIN] saveProxyConfig error:", err && err.message); }
+}
+
+// Áp proxy vào session của slot (partition persist:slotN). null = direct.
+async function applyProxyToSlot(slotId, proxyStr) {
+  const id = Number(slotId) || 1;
+  const { session: electronSession } = require("electron");
+  const ses = electronSession.fromPartition(`persist:slot${id}`);
+  const px = proxyStr ? chromePool.parseProxy(proxyStr) : null;
+  if (px) { px._raw = proxyStr; proxyState.slots.set(id, px); }
+  else proxyState.slots.delete(id);
+  try {
+    if (px) {
+      await ses.setProxy({ mode: "fixed_servers", proxyRules: px.electronRules, proxyBypassRules: "<local>" });
+      log(`[proxy] slot ${id} ← ${px.redacted}`);
+    } else {
+      await ses.setProxy({ mode: "direct" });
+      log(`[proxy] slot ${id} ← direct`);
+    }
+  } catch (err) { log(`[proxy] slot ${id} setProxy lỗi: ${err.message}`); }
+  saveProxyConfig();
+  return px;
+}
+
+// Lấy proxy kế tiếp từ pool (xoay vòng)
+function nextPoolProxy() {
+  if (!proxyState.pool.length) return null;
+  const raw = (proxyState._poolRaw && proxyState._poolRaw.length)
+    ? proxyState._poolRaw[proxyState.poolIdx % proxyState._poolRaw.length]
+    : proxyState.pool[proxyState.poolIdx % proxyState.pool.length].server;
+  proxyState.poolIdx = (proxyState.poolIdx + 1) % proxyState.pool.length;
+  return raw;
+}
+
+// Login handler cho proxy có auth (407) — áp cho mọi session slot
+function registerProxyLogin() {
+  app.on("login", (event, webContents, _details, authInfo, callback) => {
+    try {
+      if (!authInfo || !authInfo.isProxy) return; // chỉ xử lý proxy auth
+      const slotId = getSlotIdByWebContentsId(webContents && webContents.id);
+      const px = slotId && proxyState.slots.get(slotId);
+      if (px && px.hasAuth) {
+        event.preventDefault();
+        callback(px.username, px.password);
+      }
+    } catch (_) {}
+  });
+}
+
+// Script stealth chống fingerprint cơ bản (chạy main world trước trang)
+const STEALTH_JS = `
+(function(){
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch(e){}
+  try { if (!window.chrome) window.chrome = { runtime: {} }; } catch(e){}
+  try {
+    const q = navigator.permissions && navigator.permissions.query;
+    if (q) navigator.permissions.query = (p) => (p && p.name === 'notifications')
+      ? Promise.resolve({ state: (typeof Notification!=='undefined'?Notification.permission:'default') })
+      : q(p);
+  } catch(e){}
+  try { Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN','vi','en-US','en'] }); } catch(e){}
+  try { Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] }); } catch(e){}
+})();
+`;
 
 let controlWin = null;
 const previewWins = new Set(); // các cửa sổ preview nổi (có thể mở nhiều)
@@ -824,7 +992,7 @@ function createWebWindowForSlot(slotId) {
   // Đây là cách duy nhất reliable để override window.confirm trong main world
   async function registerNotiScript() {
     const rules = slotNotiRules.get(id) || [];
-    const script = `
+    const script = STEALTH_JS + `
 (function() {
   var _orig = window.confirm;
   var _origAlert = window.alert;
@@ -909,6 +1077,10 @@ function createWebWindowForSlot(slotId) {
     sendWebResult({ type: "detectlab_status", message: "Web page loaded", slotId: id });
     // noti-inject.js đã chạy trước trang, chỉ cần update rules
     updateNotiRules();
+    // đồng bộ trạng thái captcha watcher (enabled/cooldown + pattern custom) sau mỗi lần load
+    try {
+      win.webContents.send("captcha:config", buildRendererCaptchaCfg());
+    } catch (_) {}
   });
 
   win.webContents.on("did-navigate-in-page", () => { updateNotiRules(); });
@@ -2528,6 +2700,357 @@ ipcMain.handle("session:delete", async (_event, payload) => {
   }
 });
 
+// ═════════════════════════════════════════════════════════════
+// Chrome-pool: harvest cookie từ Chrome thật + xoay vòng identity
+// + auto-reset khi gặp captcha
+// ═════════════════════════════════════════════════════════════
+
+// Suy domain "chính" (2 phần cuối hostname) từ URL hiện tại của slot
+function slotMainDomain(win) {
+  try {
+    const url = win.webContents.getURL();
+    const u = new URL(url);
+    const parts = u.hostname.split(".");
+    return parts.length >= 2 ? parts.slice(-2).join(".") : u.hostname;
+  } catch (_) { return ""; }
+}
+
+// Xoá sạch cookie + storage của slot (fresh)
+async function clearSlotStorage(win) {
+  if (!win || win.isDestroyed()) return;
+  const ses = win.webContents.session;
+  try {
+    await ses.clearStorageData({
+      storages: ["cookies", "localstorage", "caches", "indexdb", "serviceworkers", "websql", "shadercache"],
+    });
+  } catch (err) {
+    // fallback: xoá cookie thủ công
+    try {
+      const cookies = await ses.cookies.get({});
+      for (const c of cookies) {
+        const dom = (c.domain || "").replace(/^\./, "");
+        const url = `${c.secure ? "https" : "http"}://${dom}${c.path || "/"}`;
+        try { await ses.cookies.remove(url, c.name); } catch (_) {}
+      }
+    } catch (_) {}
+  }
+  try { await ses.cookies.flushStore(); } catch (_) {}
+}
+
+/**
+ * Reset identity của 1 slot:
+ *   1. burn identity hiện tại trong pool
+ *   2. clear cookie/storage slot
+ *   3. lấy identity sạch kế tiếp từ pool (auto-harvest nếu pool cạn)
+ *   4. inject cookie + reload
+ * reason: "captcha" | "manual" | ...
+ */
+async function resetSlotIdentity(slotId, reason = "manual") {
+  const id = Number(slotId) || 1;
+  if (slotResetting.has(id)) {
+    return { ok: false, reason: "đang reset, bỏ qua trùng" };
+  }
+  const win = ensureWebWindow(id);
+  if (!win) return { ok: false, reason: `slot ${id} chưa mở` };
+
+  slotResetting.add(id);
+  try {
+    const domain = slotMainDomain(win);
+    const curUrl = win.webContents.getURL();
+
+    // 1. burn identity hiện tại
+    const prev = slotIdentity.get(id);
+    if (prev && prev.identityId && prev.domain) {
+      try { chromePool.markBurned(prev.domain, prev.identityId); } catch (_) {}
+    }
+
+    sendToControl("slot:reset-start", { slotId: id, reason, domain });
+    log(`[reset] slot ${id} reason=${reason} domain=${domain}`);
+
+    // 2. clear
+    await clearSlotStorage(win);
+
+    // 2b. xoay IP: rút proxy kế tiếp từ pool (nếu bật) → đổi IP cho lần này
+    if (proxyState.rotateOnReset && proxyState.pool.length) {
+      const nextProxy = nextPoolProxy();
+      if (nextProxy) {
+        await applyProxyToSlot(id, nextProxy);
+        const px = proxyState.slots.get(id);
+        log(`[reset] slot ${id} xoay IP → ${px ? px.redacted : nextProxy}`);
+      }
+    }
+
+    // 3. lấy identity sạch kế tiếp
+    let next = domain ? chromePool.takeNextClean(domain, id) : null;
+
+    // pool cạn → auto-harvest 1 bộ fresh nếu bật
+    if (!next && domain && captchaConfig.autoHarvestOnEmpty && curUrl && /^https?:/i.test(curUrl)) {
+      try {
+        log(`[reset] pool cạn → auto-harvest từ Chrome riêng slot ${id}`);
+        const slotPx = proxyState.slots.get(id);
+        const h = await chromePool.harvestCookies({
+          url: curUrl,
+          slotId: id,
+          waitMs: captchaConfig.harvestWaitMs,
+          persistent: true,
+          domainFilter: domain,
+          proxy: slotPx ? (slotPx._raw || slotPx.server) : null,
+        });
+        if (h && h.cookies && h.cookies.length) {
+          chromePool.addIdentity(domain, h.cookies, { source: "auto-harvest", harvestedFor: id });
+          next = chromePool.takeNextClean(domain, id);
+        }
+      } catch (err) {
+        log(`[reset] auto-harvest lỗi: ${err.message}`);
+      }
+    }
+
+    // 4. inject + reload
+    if (next && next.cookies && next.cookies.length) {
+      await injectSessionToWindow(win, { cookies: next.cookies, localStorage: {}, sessionStorage: {} });
+      try { await win.webContents.session.cookies.flushStore(); } catch (_) {}
+      slotIdentity.set(id, { domain, identityId: next.id });
+      log(`[reset] slot ${id} ← identity ${next.id} (${next.cookies.length} cookie)`);
+    } else {
+      slotIdentity.delete(id);
+      log(`[reset] slot ${id} không có identity sạch → chạy fresh (no cookie)`);
+    }
+
+    // reload trang hiện tại
+    if (curUrl && /^https?:/i.test(curUrl)) {
+      try { await win.loadURL(curUrl); } catch (_) {}
+    } else {
+      try { win.webContents.reload(); } catch (_) {}
+    }
+
+    const status = domain ? chromePool.poolStatus(domain) : null;
+    sendToControl("slot:reset-done", {
+      slotId: id, reason, domain,
+      identityId: next ? next.id : null,
+      injected: next ? next.cookies.length : 0,
+      pool: status,
+    });
+    return { ok: true, slotId: id, identityId: next ? next.id : null, pool: status };
+  } catch (err) {
+    log(`[reset] slot ${id} lỗi: ${err.message}`);
+    return { ok: false, reason: err.message };
+  } finally {
+    slotResetting.delete(id);
+  }
+}
+
+// Captcha phát hiện từ preload-web → tự reset nếu bật
+ipcMain.on("web:captcha-detected", async (_event, data) => {
+  const slotId = (data && data.slotId)
+    || getSlotIdByWebContentsId(_event.sender && _event.sender.id) || 1;
+  log(`[captcha] slot ${slotId} signal=${data && data.signal}`);
+  // báo control để hiện cảnh báo
+  sendToControl("slot:captcha", { slotId, signal: data && data.signal, url: data && data.url });
+  if (captchaConfig.enabled && captchaConfig.autoReset) {
+    await resetSlotIdentity(slotId, "captcha");
+  }
+});
+
+// IPC: harvest cookie thủ công từ Chrome thật của slot → thêm vào pool
+ipcMain.handle("chrome:harvest", async (_event, payload) => {
+  try {
+    const url = String((payload && payload.url) || "").trim();
+    const slotId = Number(payload && payload.slotId) || 1;
+    const slotPx = proxyState.slots.get(slotId);
+    // url trống cũng OK: harvest sẽ tự lấy URL từ tab Chrome đang mở của slot
+    const h = await chromePool.harvestCookies({
+      url: url || undefined,
+      slotId,
+      waitMs: Number(payload && payload.waitMs) || captchaConfig.harvestWaitMs,
+      persistent: payload && payload.persistent !== false,
+      domainFilter: (payload && payload.domain) || "",
+      headless: !!(payload && payload.headless),
+      proxy: (payload && payload.proxy) || (slotPx ? (slotPx._raw || slotPx.server) : null),
+    });
+    if (!h || !h.cookies || !h.cookies.length) {
+      return { ok: false, reason: "không lấy được cookie nào", domain: h && h.domain };
+    }
+    const entry = chromePool.addIdentity(h.domain, h.cookies, { source: "manual-harvest" });
+    return { ok: true, domain: h.domain, identityId: entry.id, cookieCount: h.cookies.length, pool: chromePool.poolStatus(h.domain) };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
+// IPC: mở Chrome thật riêng của slot (để đăng nhập tay rồi harvest)
+ipcMain.handle("chrome:open", async (_event, payload) => {
+  try {
+    const slotId = Number(payload && payload.slotId) || 1;
+    const url = payload && payload.url;
+    const slotPx = proxyState.slots.get(slotId);
+    const entry = await chromePool.openInChrome(slotId, url, {
+      proxy: (payload && payload.proxy) || (slotPx ? (slotPx._raw || slotPx.server) : null),
+    });
+    return { ok: true, slotId, port: entry.port, profileDir: entry.profileDir };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
+// IPC: đóng Chrome riêng của slot
+ipcMain.handle("chrome:close", async (_event, payload) => {
+  try {
+    const slotId = Number(payload && payload.slotId) || 1;
+    chromePool.closeChrome(slotId);
+    return { ok: true, slotId };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
+// IPC: trạng thái pool (1 domain hoặc tất cả)
+ipcMain.handle("pool:status", async (_event, payload) => {
+  try {
+    const domain = (payload && payload.domain) || "";
+    return { ok: true, status: chromePool.poolStatus(domain || undefined), chromePath: chromePool.findChromePath() };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
+// IPC: recycle used → clean (tái dùng identity chưa burn)
+ipcMain.handle("pool:recycle", async (_event, payload) => {
+  try {
+    const domain = String((payload && payload.domain) || "").trim();
+    if (!domain) return { ok: false, reason: "thiếu domain" };
+    const n = chromePool.recycleUsed(domain);
+    return { ok: true, recycled: n, pool: chromePool.poolStatus(domain) };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
+// IPC: reset identity thủ công cho slot
+ipcMain.handle("slot:reset-identity", async (_event, payload) => {
+  const slotId = Number(payload && payload.slotId) || 1;
+  return await resetSlotIdentity(slotId, (payload && payload.reason) || "manual");
+});
+
+// IPC: cấu hình captcha auto-reset (push xuống slot + lưu global)
+ipcMain.handle("captcha:config", async (_event, payload) => {
+  try {
+    const cfg = payload || {};
+    if (typeof cfg.enabled === "boolean") captchaConfig.enabled = cfg.enabled;
+    if (typeof cfg.autoReset === "boolean") captchaConfig.autoReset = cfg.autoReset;
+    if (typeof cfg.autoHarvestOnEmpty === "boolean") captchaConfig.autoHarvestOnEmpty = cfg.autoHarvestOnEmpty;
+    if (Number.isFinite(cfg.cooldownMs)) captchaConfig.cooldownMs = cfg.cooldownMs;
+    if (Number.isFinite(cfg.harvestWaitMs)) captchaConfig.harvestWaitMs = cfg.harvestWaitMs;
+
+    // pattern tuỳ chỉnh (lưu lại để boot sau vẫn còn)
+    if (Array.isArray(cfg.textPatterns)) captchaConfig.customTextPatterns = cfg.textPatterns.map(String);
+    if (Array.isArray(cfg.srcPatterns)) captchaConfig.customSrcPatterns = cfg.srcPatterns.map(String);
+    if (Array.isArray(cfg.urlPatterns)) captchaConfig.customUrlPatterns = cfg.urlPatterns.map(String);
+    saveCaptchaConfig();
+
+    const rendererCfg = buildRendererCaptchaCfg();
+    const targets = (cfg.slotId != null)
+      ? [Number(cfg.slotId)]
+      : Array.from(webSlots.keys());
+    for (const sid of targets) {
+      const w = webSlots.get(sid);
+      if (w && !w.isDestroyed()) {
+        try { w.webContents.send("captcha:config", rendererCfg); } catch (_) {}
+      }
+    }
+    return { ok: true, config: captchaConfig };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
+// IPC: đọc config captcha hiện tại
+ipcMain.handle("captcha:get-config", async () => {
+  return { ok: true, config: captchaConfig };
+});
+
+// ── Proxy IPC ────────────────────────────────────────────────────────────────
+
+// Đặt proxy cho 1 slot (string rỗng/null = direct)
+ipcMain.handle("proxy:set", async (_event, payload) => {
+  try {
+    const slotId = Number(payload && payload.slotId) || 1;
+    const proxyStr = (payload && payload.proxy != null) ? String(payload.proxy).trim() : "";
+    const px = await applyProxyToSlot(slotId, proxyStr || null);
+    // reload slot để áp IP mới ngay
+    const win = ensureWebWindow(slotId);
+    if (win && payload && payload.reload) {
+      const u = win.webContents.getURL();
+      if (u && /^https?:/i.test(u)) { try { await win.loadURL(u); } catch (_) {} }
+    }
+    return { ok: true, slotId, proxy: px ? px.redacted : null };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
+// Lấy cấu hình proxy hiện tại (đã ẩn mật khẩu)
+ipcMain.handle("proxy:get", async () => {
+  const slots = {};
+  for (const [id, px] of proxyState.slots) slots[id] = px.redacted;
+  return {
+    ok: true,
+    slots,
+    pool: (proxyState._poolRaw || []).map((s) => { const p = chromePool.parseProxy(s); return p ? p.redacted : s; }),
+    rotateOnReset: proxyState.rotateOnReset,
+  };
+});
+
+// Đặt danh sách proxy pool (xoay vòng khi reset) + bật/tắt rotate
+ipcMain.handle("proxy:set-pool", async (_event, payload) => {
+  try {
+    const arr = Array.isArray(payload && payload.pool) ? payload.pool : [];
+    proxyState._poolRaw = arr.map((s) => String(s).trim()).filter(Boolean);
+    proxyState.pool = proxyState._poolRaw.map((s) => chromePool.parseProxy(s)).filter(Boolean);
+    proxyState.poolIdx = 0;
+    if (typeof (payload && payload.rotateOnReset) === "boolean") {
+      proxyState.rotateOnReset = payload.rotateOnReset;
+    }
+    saveProxyConfig();
+    return { ok: true, count: proxyState.pool.length, rotateOnReset: proxyState.rotateOnReset };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
+// Test 1 proxy: gọi qua session tạm tới dịch vụ echo IP
+ipcMain.handle("proxy:test", async (_event, payload) => {
+  const { session: electronSession, net } = require("electron");
+  const proxyStr = String((payload && payload.proxy) || "").trim();
+  const testUrl = (payload && payload.url) || "https://api.ipify.org?format=json";
+  const px = proxyStr ? chromePool.parseProxy(proxyStr) : null;
+  if (!px) return { ok: false, reason: "proxy không hợp lệ" };
+  try {
+    const testSes = electronSession.fromPartition(`proxy-test-${Date.now()}`);
+    await testSes.setProxy({ mode: "fixed_servers", proxyRules: px.electronRules, proxyBypassRules: "<local>" });
+    // auth cho session test
+    const onLogin = (event, _wc, _d, authInfo, cb) => {
+      if (authInfo && authInfo.isProxy && px.hasAuth) { event.preventDefault(); cb(px.username, px.password); }
+    };
+    app.on("login", onLogin);
+    const result = await new Promise((resolve) => {
+      const req = net.request({ url: testUrl, session: testSes });
+      let body = "";
+      const timer = setTimeout(() => { try { req.abort(); } catch (_) {} resolve({ ok: false, reason: "timeout" }); }, 12000);
+      req.on("response", (res) => {
+        res.on("data", (c) => { body += c.toString(); });
+        res.on("end", () => { clearTimeout(timer); resolve({ ok: true, status: res.statusCode, body: body.slice(0, 200) }); });
+      });
+      req.on("error", (e) => { clearTimeout(timer); resolve({ ok: false, reason: e.message }); });
+      req.end();
+    });
+    app.removeListener("login", onLogin);
+    try { await testSes.clearStorageData(); } catch (_) {}
+    return { proxy: px.redacted, ...result };
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+});
+
 // ─────────────────────────────────────────────────────────────
 // Localhost control / debug endpoint
 // ─────────────────────────────────────────────────────────────
@@ -2546,6 +3069,29 @@ ipcMain.handle("session:delete", async (_event, payload) => {
 const CONTROL_PORT = 7331;
 const MAX_LOG_LINES = 2000;
 const logBuffer = [];
+
+// Token bảo vệ control server: client ngoài phải gửi header x-control-token.
+// Sinh ngẫu nhiên mỗi lần boot, ghi ra file userData để automation tin cậy đọc.
+let CONTROL_TOKEN = null;
+function ensureControlToken() {
+  if (CONTROL_TOKEN) return CONTROL_TOKEN;
+  try {
+    const crypto = require("crypto");
+    CONTROL_TOKEN = crypto.randomBytes(24).toString("hex");
+  } catch (_) {
+    CONTROL_TOKEN = "tok_" + process.pid + "_" + process.hrtime.bigint().toString(36);
+  }
+  try {
+    const p = path.join(app.getPath("userData"), "control-token.txt");
+    fs.writeFileSync(p, CONTROL_TOKEN, "utf8");
+    console.log("[MAIN] control token ghi tại:", p);
+  } catch (err) { console.warn("[MAIN] ghi control-token lỗi:", err && err.message); }
+  return CONTROL_TOKEN;
+}
+function checkControlAuth(req) {
+  const tok = req.headers["x-control-token"];
+  return !!CONTROL_TOKEN && tok === CONTROL_TOKEN;
+}
 
 function _formatLogArg(a) {
   if (a == null) return String(a);
@@ -2635,20 +3181,28 @@ function _readJsonBody(req) {
 }
 
 function startControlServer() {
+  ensureControlToken();
   const http = require("http");
   const server = http.createServer(async (req, res) => {
     const json = (status, body) => {
+      // KHÔNG đặt Access-Control-Allow-Origin: '*' nữa.
+      // Không gửi ACAO + yêu cầu header x-control-token → preflight của web ngoài
+      // sẽ fail, chặn được CSRF/RCE từ trang web bất kỳ mà user mở trong browser.
       res.writeHead(status, {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
+        "Vary": "Origin",
       });
       res.end(JSON.stringify(body));
     };
 
     if (req.method === "OPTIONS") {
+      // Không cho phép cross-origin preflight (không reflect Origin / không allow header).
       return json(204, {});
+    }
+
+    // Mọi endpoint đều yêu cầu token (trừ OPTIONS đã xử lý ở trên).
+    if (!checkControlAuth(req)) {
+      return json(401, { ok: false, reason: "unauthorized: thiếu/sai x-control-token" });
     }
 
     try {
@@ -2724,6 +3278,28 @@ app.whenReady().then(() => {
   // KHÔNG dùng Menu.setApplicationMenu(null) vì sẽ làm hỏng Ctrl+C/V/A trong input.
   // Thay vào đó ẩn thanh menu ở từng cửa sổ (vẫn giữ phím tắt edit).
 
+  // Khởi tạo chrome-pool: thư mục lưu profile + cookie pool, logger chung
+  try {
+    chromePool.setLogger((...a) => log("[chrome-pool]", ...a));
+    chromePool.init(app.getPath("userData"));
+  } catch (err) {
+    console.warn("[MAIN] chromePool.init error:", err && err.message);
+  }
+
+  // Captcha: nạp cấu hình + pattern custom đã lưu
+  try { loadCaptchaConfig(); } catch (_) {}
+
+  // Proxy: nạp cấu hình + đăng ký handler auth + áp cho từng slot
+  try {
+    registerProxyLogin();
+    loadProxyConfig();
+    for (const [id, px] of proxyState.slots) {
+      applyProxyToSlot(id, px._raw || px.server);
+    }
+  } catch (err) {
+    console.warn("[MAIN] proxy init error:", err && err.message);
+  }
+
   createWindows();
   startControlServer();
 
@@ -2753,4 +3329,12 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+// Đảm bảo kill mọi Chrome riêng khi thoát app (tránh process mồ côi)
+app.on("before-quit", () => {
+  try { chromePool.closeAllChrome(); } catch (_) {}
+});
+app.on("will-quit", () => {
+  try { chromePool.closeAllChrome(); } catch (_) {}
 });

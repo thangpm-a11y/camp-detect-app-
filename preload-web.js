@@ -3039,3 +3039,185 @@ window.__DL_NOTI__ = {
     return NOTI_MODE;
   }
 };
+
+// =========================================================
+// Captcha auto-detect watcher
+// ---------------------------------------------------------
+// Dò dấu hiệu captcha (reCAPTCHA / hCaptcha / Cloudflare Turnstile + pattern
+// tuỳ chỉnh). Khi phát hiện → báo main qua ipc "web:captcha-detected"
+// (main tự suy slotId từ webContentsId của sender, giống web:result).
+// Có debounce + cooldown để không bắn lặp; tự re-arm khi captcha biến mất.
+// =========================================================
+const CAPTCHA = {
+  enabled: true,
+  cooldownMs: 12000,
+  // text patterns (lowercase, includes-match) — bổ sung từ control qua config
+  textPatterns: [
+    "i'm not a robot",
+    "verify you are human",
+    "verifying you are human",
+    "unusual traffic",
+    "are you a robot",
+    "xác minh bạn là người",
+    "xác nhận bạn không phải robot",
+    "checking your browser",
+    "needs to review the security",
+  ],
+  // iframe/src + URL substrings
+  srcPatterns: [
+    "google.com/recaptcha",
+    "recaptcha/api2",
+    "recaptcha/enterprise",
+    "hcaptcha.com",
+    "challenges.cloudflare.com",
+    "turnstile",
+    "/cdn-cgi/challenge-platform",
+  ],
+  // url patterns (location.href includes)
+  urlPatterns: [],
+  _lastFire: 0,
+  _armed: true, // true = sẵn sàng bắn; false = đã bắn, chờ captcha biến mất để re-arm
+};
+
+function _captchaVisible(el) {
+  if (!el) return false;
+  try {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) return false;
+    return true;
+  } catch (_) { return true; }
+}
+
+// Trả về chuỗi tín hiệu nếu phát hiện captcha, ngược lại null
+function detectCaptcha() {
+  if (!CAPTCHA.enabled) return null;
+  try {
+    const href = String(location.href || "").toLowerCase();
+    for (const p of CAPTCHA.urlPatterns) {
+      if (p && href.includes(String(p).toLowerCase())) return "url:" + p;
+    }
+
+    // iframe theo src
+    const iframes = document.querySelectorAll("iframe[src]");
+    for (const f of iframes) {
+      const src = String(f.getAttribute("src") || "").toLowerCase();
+      for (const p of CAPTCHA.srcPatterns) {
+        if (src.includes(p) && _captchaVisible(f)) return "iframe:" + p;
+      }
+    }
+
+    // script src (turnstile/recaptcha api loader) — dấu hiệu phụ
+    // chỉ tính khi kèm widget container hiển thị
+    const widgets = document.querySelectorAll(
+      ".g-recaptcha, .h-captcha, #cf-challenge-running, .cf-turnstile, [data-sitekey], #challenge-stage, #challenge-form"
+    );
+    for (const w of widgets) {
+      if (_captchaVisible(w)) return "widget:" + (w.className || w.id || "node");
+    }
+
+    // text match — DỄ false-positive nên siết: chỉ tính khi trang giống
+    // "trang challenge" (nội dung ngắn) HOẶC title khớp. Trang nội dung dài
+    // (bài viết, dashboard…) bỏ qua text signal để tránh báo nhầm.
+    const rawText = (document.body && document.body.innerText) ? document.body.innerText : "";
+    const title = String(document.title || "").toLowerCase();
+    const isShort = rawText.length > 0 && rawText.length < 1500; // challenge page thường rất ngắn
+    const titleHit = CAPTCHA.textPatterns.some((t) => t && title.includes(t));
+    if (titleHit) return "title:" + (CAPTCHA.textPatterns.find((t) => t && title.includes(t)));
+    if (isShort) {
+      const bodyText = rawText.slice(0, 4000).toLowerCase();
+      for (const t of CAPTCHA.textPatterns) {
+        if (t && bodyText.includes(t)) return "text:" + t;
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+function captchaTick() {
+  if (!CAPTCHA.enabled) return;
+  const signal = detectCaptcha();
+  const now = Date.now();
+
+  if (signal) {
+    if (CAPTCHA._armed && (now - CAPTCHA._lastFire) > CAPTCHA.cooldownMs) {
+      CAPTCHA._armed = false;
+      CAPTCHA._lastFire = now;
+      try {
+        ipcRenderer.send("web:captcha-detected", {
+          signal,
+          url: location.href,
+          ts: now,
+        });
+      } catch (_) {}
+      sendLog("[Captcha] phát hiện: " + signal + " → báo main reset identity");
+    }
+  } else {
+    // không còn captcha → re-arm cho lần sau
+    CAPTCHA._armed = true;
+  }
+}
+
+let _captchaTimer = null;
+let _captchaObserver = null;
+function startCaptchaWatcher() {
+  if (_captchaTimer) return;
+  _captchaTimer = setInterval(captchaTick, 1500);
+  try {
+    _captchaObserver = new MutationObserver(() => {
+      // throttle qua _lastFire/cooldown trong captchaTick
+      captchaTick();
+    });
+    if (document.documentElement) {
+      _captchaObserver.observe(document.documentElement, { childList: true, subtree: true });
+    }
+  } catch (_) {}
+  captchaTick();
+}
+
+// Nhận config từ main/control
+function _mergeUnique(base, extra) {
+  const set = new Set(base.map((x) => String(x).toLowerCase()));
+  for (const e of extra) {
+    const v = String(e);
+    if (!set.has(v.toLowerCase())) { base.push(v); set.add(v.toLowerCase()); }
+  }
+  return base;
+}
+ipcRenderer.on("captcha:config", (_e, cfg) => {
+  if (!cfg || typeof cfg !== "object") return;
+  if (typeof cfg.enabled === "boolean") CAPTCHA.enabled = cfg.enabled;
+  if (Number.isFinite(cfg.cooldownMs)) CAPTCHA.cooldownMs = cfg.cooldownMs;
+  // MERGE custom patterns vào default (không xoá default)
+  if (Array.isArray(cfg.textPatterns)) _mergeUnique(CAPTCHA.textPatterns, cfg.textPatterns);
+  if (Array.isArray(cfg.srcPatterns)) _mergeUnique(CAPTCHA.srcPatterns, cfg.srcPatterns);
+  if (Array.isArray(cfg.urlPatterns)) _mergeUnique(CAPTCHA.urlPatterns, cfg.urlPatterns);
+  // replace toàn bộ nếu yêu cầu rõ (reset patterns)
+  if (cfg.replacePatterns) {
+    if (Array.isArray(cfg.textPatterns)) CAPTCHA.textPatterns = cfg.textPatterns.map(String);
+    if (Array.isArray(cfg.srcPatterns)) CAPTCHA.srcPatterns = cfg.srcPatterns.map(String);
+    if (Array.isArray(cfg.urlPatterns)) CAPTCHA.urlPatterns = cfg.urlPatterns.map(String);
+  }
+  CAPTCHA._armed = true;
+  sendLog("[Captcha] config cập nhật: enabled=" + CAPTCHA.enabled);
+});
+
+window.__DL_CAPTCHA__ = {
+  detectNow: () => detectCaptcha(),
+  getConfig: () => ({ ...CAPTCHA }),
+  setEnabled: (v) => { CAPTCHA.enabled = !!v; CAPTCHA._armed = true; return CAPTCHA.enabled; },
+  addPattern: (kind, p) => {
+    const map = { text: "textPatterns", src: "srcPatterns", url: "urlPatterns" };
+    const key = map[kind];
+    if (key && p) CAPTCHA[key].push(String(p));
+    return CAPTCHA[key] ? CAPTCHA[key].length : 0;
+  },
+};
+
+// Khởi động watcher khi DOM sẵn sàng
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", startCaptchaWatcher, { once: true });
+} else {
+  startCaptchaWatcher();
+}

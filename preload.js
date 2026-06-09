@@ -55,6 +55,25 @@ deleteSession: payload => safeInvoke("session:delete", payload || {}),
 clearSessionCookies: payload => safeInvoke("session:clear-cookies", payload || {}),
 onWebResult: handler => safeOn("web:result", handler),
 
+// Chrome-pool / anti-detect / captcha auto-reset
+chromeHarvest: payload => safeInvoke("chrome:harvest", payload || {}),
+chromeOpen: payload => safeInvoke("chrome:open", payload || {}),
+chromeClose: payload => safeInvoke("chrome:close", payload || {}),
+poolStatus: payload => safeInvoke("pool:status", payload || {}),
+poolRecycle: payload => safeInvoke("pool:recycle", payload || {}),
+resetSlotIdentity: payload => safeInvoke("slot:reset-identity", payload || {}),
+captchaConfig: payload => safeInvoke("captcha:config", payload || {}),
+captchaGetConfig: () => safeInvoke("captcha:get-config", {}),
+
+// Proxy / IP per-slot
+proxySet: payload => safeInvoke("proxy:set", payload || {}),
+proxyGet: () => safeInvoke("proxy:get", {}),
+proxySetPool: payload => safeInvoke("proxy:set-pool", payload || {}),
+proxyTest: payload => safeInvoke("proxy:test", payload || {}),
+onCaptcha: handler => safeOn("slot:captcha", handler),
+onResetStart: handler => safeOn("slot:reset-start", handler),
+onResetDone: handler => safeOn("slot:reset-done", handler),
+
 // Slot management
 openSlot: slotId => safeInvoke("slot:open", { slotId }),
 closeSlot: slotId => safeInvoke("slot:close", { slotId }),
