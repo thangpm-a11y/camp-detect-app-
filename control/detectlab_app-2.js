@@ -584,6 +584,8 @@ window.controlAPI.on("slot:page-loaded", data => {
   const groupCollapsed = {};
   // Group rỗng vừa tạo (chưa có step) — hiện placeholder để kéo step vào
   let pendingEmptyGroups = [];
+  // Đang kéo cả 1 group (mảng step object) để đổi vị trí
+  let draggingGroupSteps = null;
   // Editor step đang mở — để picker (Pos/Sel) cập nhật live vào các ô của editor
   let activeEditorCtx = null;
 
@@ -965,7 +967,7 @@ conditionOp: "",     // "" | equal | exact | different | contain | > | < | >= | 
 conditionValueColumn: "",
 conditionValue: "",
 // What to do when the condition evaluates TRUE:
-//   "jump" → jump to step with fieldId = conditionJumpTo
+//   "jump" → jump to step có id = conditionJumpTo (id ổn định, không theo số thứ tự)
 //   "stop" → stop the row's pattern
 conditionTrueMode: "stop",
 conditionJumpTo: "",
@@ -2284,8 +2286,16 @@ window.addEventListener("message", event => {
       const head = document.createElement("div");
       Object.assign(head.style, {
         display: "flex", alignItems: "center", gap: "8px",
-        padding: "6px 8px", cursor: "pointer", userSelect: "none"
+        padding: "6px 8px", cursor: "grab", userSelect: "none"
       });
+      // Kéo cả group để đổi vị trí trong danh sách step
+      head.draggable = true;
+      head.addEventListener("dragstart", (e) => {
+        draggingGroupSteps = steps.filter(s => s && String(s.groupName || "").trim() === name);
+        draggingIndex = null;
+        try { e.dataTransfer.effectAllowed = "move"; } catch (_) {}
+      });
+      head.addEventListener("dragend", () => { draggingGroupSteps = null; });
       const caret = document.createElement("span");
       caret.textContent = collapsed ? "▸" : "▾";
       caret.style.color = "#c4b5fd";
@@ -2310,6 +2320,25 @@ window.addEventListener("message", event => {
         steps.forEach(s => { if (s && String(s.groupName || "").trim() === name) delete s.groupName; });
         flushProxies();
         renderSteps();
+      };
+
+      // Xóa group: xóa luôn các step thuộc group (khác Ungroup)
+      const delGBtn = document.createElement("button");
+      delGBtn.textContent = "🗑 Xóa";
+      delGBtn.title = "Xóa group này và toàn bộ step bên trong";
+      Object.assign(delGBtn.style, { fontSize: "11px", border: "1px solid #7f1d1d", background: "rgba(127,29,29,0.6)", color: "#fecaca", borderRadius: "5px", cursor: "pointer", padding: "1px 6px" });
+      delGBtn.onclick = (e) => {
+        e.stopPropagation();
+        const cnt = groupCounts[name] || 0;
+        if (!window.confirm("Xóa group \"" + name + "\" và " + cnt + " step bên trong? Không thể hoàn tác.")) return;
+        for (let i = steps.length - 1; i >= 0; i--) {
+          if (steps[i] && String(steps[i].groupName || "").trim() === name) steps.splice(i, 1);
+        }
+        delete groupCollapsed[name];
+        clearPendingEmpty(name);
+        flushProxies();
+        renderSteps();
+        setLog("Đã xóa group: " + name + " (" + cnt + " step)");
       };
 
       const body = document.createElement("div");
@@ -2344,10 +2373,55 @@ window.addEventListener("message", event => {
       head.appendChild(nm);
       head.appendChild(saveGBtn);
       head.appendChild(ungBtn);
+      head.appendChild(delGBtn);
       wrap.appendChild(head);
       wrap.appendChild(body);
       container.appendChild(wrap);
       curGroupBody = body;
+    }
+
+    // Thả vào KHE giữa các item top-level: chèn vào vị trí targetArrIndex,
+    // step lẻ → BỎ group (nằm giữa, không thuộc group nào); group → di chuyển cả khối.
+    function dropAtGap(targetArrIndex) {
+      const anchorObj = steps[targetArrIndex] || null; // step đứng ngay sau khe (trước khi xóa)
+      if (draggingGroupSteps && draggingGroupSteps.length) {
+        const set = new Set(draggingGroupSteps);
+        const block = steps.filter(s => set.has(s)); // giữ đúng thứ tự
+        steps = steps.filter(s => !set.has(s));
+        let ins = anchorObj ? steps.indexOf(anchorObj) : steps.length;
+        if (ins < 0) ins = steps.length;
+        steps.splice(ins, 0, ...block);
+        draggingGroupSteps = null;
+      } else if (draggingIndex != null) {
+        const moved = steps[draggingIndex];
+        if (!moved) { draggingIndex = null; return; }
+        steps.splice(draggingIndex, 1);
+        delete moved.groupName; // khe = nằm ngoài group
+        let ins = anchorObj ? steps.indexOf(anchorObj) : steps.length;
+        if (ins < 0) ins = steps.length;
+        steps.splice(ins, 0, moved);
+        draggingIndex = null;
+      } else { return; }
+      flushProxies();
+      renderSteps();
+    }
+
+    function makeGapZone(targetArrIndex) {
+      const gap = document.createElement("div");
+      Object.assign(gap.style, { height: "8px", margin: "0", borderRadius: "4px", transition: "all .1s" });
+      gap.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        gap.style.height = "20px";
+        gap.style.background = "rgba(59,130,246,0.35)";
+      });
+      gap.addEventListener("dragleave", () => {
+        gap.style.height = "8px"; gap.style.background = "transparent";
+      });
+      gap.addEventListener("drop", (e) => {
+        e.preventDefault(); e.stopPropagation();
+        dropAtGap(targetArrIndex);
+      });
+      return gap;
     }
 
     steps.forEach((step, index) => {
@@ -2380,6 +2454,8 @@ window.addEventListener("message", event => {
       row.addEventListener("drop", e => {
         e.preventDefault();
         e.stopPropagation();
+        // Đang kéo CẢ group → thả lên 1 step nghĩa là di chuyển group tới ngay trước step đó
+        if (draggingGroupSteps && draggingGroupSteps.length) { dropAtGap(index); return; }
         const targetIndex = index;
         if (draggingIndex == null || draggingIndex === targetIndex) return;
         const moved = steps[draggingIndex];
@@ -2786,17 +2862,24 @@ window.addEventListener("message", event => {
       // Đưa row vào group container nếu step thuộc group
       const gname = String(step.groupName || "").trim();
       if (gname) {
-        if (gname !== curGroupName) startGroup(gname);
+        if (gname !== curGroupName) {
+          container.appendChild(makeGapZone(index)); // khe trước 1 group mới
+          startGroup(gname);
+        }
         curGroupBody.appendChild(row);
       } else {
         curGroupName = null;
         curGroupBody = null;
+        container.appendChild(makeGapZone(index)); // khe trước step lẻ
         container.appendChild(row);
       }
     });
 
-    // Render các group RỖNG (vừa Add Group, chưa có step) làm vùng kéo-thả
+    // Khe cuối cùng (thả xuống cuối danh sách)
     curGroupName = null; curGroupBody = null;
+    container.appendChild(makeGapZone(steps.length));
+
+    // Render các group RỖNG (vừa Add Group, chưa có step) làm vùng kéo-thả
     pendingEmptyGroups.forEach(name => {
       const has = steps.some(s => s && String(s.groupName || "").trim() === name);
       if (!has) startGroup(name);
@@ -3068,9 +3151,44 @@ window.addEventListener("message", event => {
     );
     conditionTrueModeSelect.style.width = "100%";
 
-    const conditionJumpToInput = makeSmallInput("text", step.conditionJumpTo || "", "100%");
-    conditionJumpToInput.style.width = "100%";
-    conditionJumpToInput.placeholder = "Số thứ tự step (vd: 2 hoặc #2)";
+    // Jump target: dropdown neo theo ID step (ổn định khi thêm/xóa/đổi thứ tự).
+    // KHÔNG lưu số thứ tự cố định nữa — số thứ tự dịch chuyển sẽ làm jump sai.
+    const conditionJumpToInput = document.createElement("select");
+    Object.assign(conditionJumpToInput.style, {
+      width: "100%", padding: "3px 6px", borderRadius: "4px",
+      border: "1px solid #475569", background: "#020617", color: "#e5e7eb",
+      fontSize: "11px", outline: "none"
+    });
+    (function buildJumpOptions() {
+      const none = document.createElement("option");
+      none.value = ""; none.textContent = "— chọn step đích —";
+      conditionJumpToInput.appendChild(none);
+
+      // Migrate giá trị cũ (số thứ tự / fieldId) → id ổn định
+      const cur = String(step.conditionJumpTo || "").trim();
+      let curId = "";
+      if (cur) {
+        const numStr = cur.replace(/^#/, "").trim();
+        if (/^\d+$/.test(numStr)) {
+          const t = steps[parseInt(numStr, 10) - 1];
+          if (t) curId = t.id;
+        } else {
+          const byId = steps.find(s => s && String(s.id) === cur);
+          const byField = steps.find(s => s && String(s.fieldId || "").trim().toLowerCase() === cur.toLowerCase());
+          curId = byId ? byId.id : (byField ? byField.id : "");
+        }
+      }
+
+      steps.forEach((s, i) => {
+        if (!s) return;
+        const opt = document.createElement("option");
+        opt.value = String(s.id);
+        const isSelf = s.id === step.id;
+        opt.textContent = "#" + (i + 1) + " · " + (s.fieldId || ("Step " + (i + 1))) + (isSelf ? " (chính nó)" : "");
+        conditionJumpToInput.appendChild(opt);
+      });
+      conditionJumpToInput.value = curId;
+    })();
 
     const clickModeSelect = makeSelect(["selector", "point"], step.clickMode || "selector", "100%");
     clickModeSelect.style.width = "100%";
@@ -3195,7 +3313,7 @@ window.addEventListener("message", event => {
     const fieldConditionValue = makeInlineField("Value (fixed)", conditionValueInput);
     const fieldCondition = makeInlineField("Expression", conditionExprInput);
     const fieldConditionTrueMode = makeInlineField("If FALSE →", conditionTrueModeSelect);
-    const fieldConditionJumpTo = makeInlineField("Jump to step #", conditionJumpToInput);
+    const fieldConditionJumpTo = makeInlineField("Jump to step", conditionJumpToInput);
     const fieldSessionName = makeInlineField("Session name", sessionNameInput);
     const fieldSourceFieldId = makeInlineField("Source field ID", sourceFieldIdInput);
     const fieldReadMode = makeInlineField("Read mode", readModeSelect);
@@ -4500,15 +4618,17 @@ window.addEventListener("message", event => {
           }
           const _steps = _st.steps;
           let jumpIndex = -1;
-          // Ưu tiên: SỐ THỨ TỰ step (vd "#2" hoặc "2") → step thứ 2 (1-based)
-          const numStr = jumpTo.replace(/^#/, "").trim();
-          if (/^\d+$/.test(numStr)) {
-            jumpIndex = parseInt(numStr, 10) - 1; // 1-based → 0-based
-          } else {
-            // Fallback: khớp theo Step name (không phân biệt hoa thường) hoặc id
+          // Ưu tiên: khớp theo ID step (ổn định, không lệ thuộc số thứ tự).
+          jumpIndex = _steps.findIndex(s => s && String(s.id || "").trim() === jumpTo);
+          if (jumpIndex < 0) {
+            // Khớp theo Step name (không phân biệt hoa thường)
             const jt = jumpTo.toLowerCase();
             jumpIndex = _steps.findIndex(s => s && String(s.fieldId || "").trim().toLowerCase() === jt);
-            if (jumpIndex < 0) jumpIndex = _steps.findIndex(s => s && String(s.id || "").trim() === jumpTo);
+          }
+          if (jumpIndex < 0) {
+            // Tương thích ngược: pattern cũ lưu SỐ THỨ TỰ (vd "#2" hoặc "2")
+            const numStr = jumpTo.replace(/^#/, "").trim();
+            if (/^\d+$/.test(numStr)) jumpIndex = parseInt(numStr, 10) - 1; // 1-based → 0-based
           }
           if (jumpIndex < 0 || jumpIndex >= _steps.length) {
             throw new Error("Condition jump: step '" + jumpTo + "' không hợp lệ (chỉ có " + _steps.length + " step)");
