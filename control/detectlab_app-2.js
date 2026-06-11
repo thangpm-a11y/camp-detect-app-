@@ -33,14 +33,17 @@ safeOnWebResult(data => {
       if (index >= 0) {
         steps[index].x = data.x;
         steps[index].y = data.y;
-        steps[index].clickMode = "point";
+        // Nếu đang chờ PosSel cho step này → clickMode = possel; ngược lại point
+        const mode = (window.__dlPosSelPending === data.stepId) ? "possel" : "point";
+        steps[index].clickMode = mode;
+        if (window.__dlPosSelPending === data.stepId) window.__dlPosSelPending = null;
         // Cập nhật live vào editor nếu đang mở đúng step này
         if (activeEditorCtx && activeEditorCtx.stepId === data.stepId) {
           if (activeEditorCtx.xInput) activeEditorCtx.xInput.value = String(data.x);
           if (activeEditorCtx.yInput) activeEditorCtx.yInput.value = String(data.y);
-          if (activeEditorCtx.clickModeSelect) activeEditorCtx.clickModeSelect.value = "point";
+          if (activeEditorCtx.clickModeSelect) activeEditorCtx.clickModeSelect.value = mode;
         }
-        setLog("Picked point for step " + (steps[index].fieldId || index + 1));
+        setLog((mode === "possel" ? "PosSel position set for step " : "Picked point for step ") + (steps[index].fieldId || index + 1) + " at (" + data.x + "," + data.y + ")");
         renderSteps();
       }
       return;
@@ -202,6 +205,29 @@ function domExec(payload, execSlotId) {
     console.warn("[DetectLab] execOnWeb error:", err, payload);
     return null;
   }
+}
+
+// Gửi lệnh + chờ kết quả (web:result có cùng requestId). Timeout → {ok:false}.
+function domExecAsync(payload, _slotId, timeoutMs) {
+  return new Promise((resolve) => {
+    const requestId = "async-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    let done = false;
+    let off = null;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      try { if (typeof off === "function") off(); } catch (_) {}
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish({ ok: false, reason: "timeout" }), timeoutMs || 10000);
+    const handler = data => {
+      if (!data || data.requestId !== requestId) return;
+      clearTimeout(timer);
+      finish(data);
+    };
+    off = safeOnWebResult(handler);
+    domExec({ ...payload, requestId }, _slotId);
+  });
 }
 
 function domGetText(selector, _slotId) {
@@ -2548,6 +2574,7 @@ window.addEventListener("message", event => {
       const btnTest = makeBtn("Test", "linear-gradient(90deg,#22c55e,#16a34a)", "#052e16");
       const btnPos = makeBtn("Pos", "linear-gradient(90deg,#f97373,#ef4444)", "#fff");
       const btnSel = makeBtn("Sel", "linear-gradient(90deg,#38bdf8,#2563eb)", "#020617");
+      const btnPosSel = makeBtn("PosSel", "linear-gradient(90deg,#a78bfa,#7c3aed)", "#fff");
       const btnModeSelector = makeBtn(
         "Selector",
         step.clickMode === "selector"
@@ -2561,6 +2588,13 @@ window.addEventListener("message", event => {
           ? "linear-gradient(90deg,#facc15,#eab308)"
           : "linear-gradient(90deg,#e5e7eb,#94a3b8)",
         step.clickMode === "point" ? "#111827" : "#020617"
+      );
+      const btnModePosSel = makeBtn(
+        "PosSel",
+        step.clickMode === "possel"
+          ? "linear-gradient(90deg,#a78bfa,#7c3aed)"
+          : "linear-gradient(90deg,#e5e7eb,#94a3b8)",
+        step.clickMode === "possel" ? "#fff" : "#020617"
       );
       const btnEdit = makeBtn("Edit", "linear-gradient(90deg,#0ea5e9,#3b82f6)", "#082f49");
       const btnDup = makeBtn("Dup", "linear-gradient(90deg,#e5e7eb,#94a3b8)", "#020617");
@@ -2707,6 +2741,7 @@ window.addEventListener("message", event => {
       if (["click", "hover", "input", "read", "upload", "delete", "download", "clicknear", "read-input", "cdpclick", "pressarrow"].includes(step.type)) {
         controlsLine.appendChild(btnPos);
         controlsLine.appendChild(btnSel);
+        controlsLine.appendChild(btnPosSel);
       }
 
       // Popup clickpoint/clickselector: thêm nút Pick từ popup window
@@ -2759,6 +2794,7 @@ window.addEventListener("message", event => {
       if (step.type === "click" || step.type === "hover") {
         controlsLine.appendChild(btnModeSelector);
         controlsLine.appendChild(btnModePoint);
+        controlsLine.appendChild(btnModePosSel);
       }
 
       controlsLine.appendChild(btnEdit);
@@ -2841,6 +2877,20 @@ window.addEventListener("message", event => {
         }
       };
 
+      // PosSel: ghi lại vị trí (x,y); lúc chạy sẽ resolve selector tại đó rồi click
+      btnPosSel.onclick = () => {
+        try {
+          window.__dlPosSelPending = steps[index] ? steps[index].id : step.id;
+          domExec({
+            type: "startPickPoint",
+            stepId: steps[index] ? steps[index].id : step.id
+          });
+          setStatus("Click trên trang để chọn vị trí cho PosSel", "run");
+        } catch (err) {
+          console.warn("[DetectLab] PosSel pick error:", err);
+        }
+      };
+
       btnModeSelector.onclick = () => {
         steps[index].clickMode = "selector";
         renderSteps();
@@ -2848,6 +2898,11 @@ window.addEventListener("message", event => {
 
       btnModePoint.onclick = () => {
         steps[index].clickMode = "point";
+        renderSteps();
+      };
+
+      btnModePosSel.onclick = () => {
+        steps[index].clickMode = "possel";
         renderSteps();
       };
 
@@ -3190,7 +3245,7 @@ window.addEventListener("message", event => {
       conditionJumpToInput.value = curId;
     })();
 
-    const clickModeSelect = makeSelect(["selector", "point"], step.clickMode || "selector", "100%");
+    const clickModeSelect = makeSelect(["selector", "point", "possel"], step.clickMode || "selector", "100%");
     clickModeSelect.style.width = "100%";
 
     const clicknearDirectionSelect = makeSelect(["right", "left"], step.clicknearDirection || "right", "100%");
@@ -4247,6 +4302,30 @@ window.addEventListener("message", event => {
     if (_st.stopped) return;
 
     const _dvars = _st.detectLabVars || {};
+
+    // PosSel: trước khi chạy, resolve selector động tại vị trí (x,y) đã ghi
+    if (step.clickMode === "possel") {
+      const px = toNumber(step.x, null);
+      const py = toNumber(step.y, null);
+      if (typeof px !== "number" || typeof py !== "number") {
+        throw new Error("PosSel cần vị trí x,y — dùng nút PosSel để chọn");
+      }
+      setLog("PosSel: resolving tại (" + px + "," + py + ") slot " + _sid + "…");
+      const result = await domExecAsync({ type: "possel", x: px, y: py, stepId: step.id }, _sid, 15000);
+      if (!result || !result.ok) {
+        setLog("PosSel fail — fallback selector cũ: " + (step.selector || "(trống)"));
+        if (!step.selector && !step.elementText && !step.labelText) {
+          throw new Error("PosSel: không có element tại (" + px + "," + py + ") — " + ((result && result.reason) || "timeout"));
+        }
+      } else {
+        step.selector = result.selector || "";
+        step.elementText = result.elementText || "";
+        step.labelText = result.labelText || "";
+        step.containerTag = result.containerTag || "";
+        step.containerClassName = result.containerClassName || "";
+        setLog("PosSel resolved: " + step.selector);
+      }
+    }
 
     if (type === "click") {
       if (step.clickMode === "point") {

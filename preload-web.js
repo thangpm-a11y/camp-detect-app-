@@ -2984,6 +2984,63 @@ return;
       return;
     }
 
+    if (type === "possel") {
+      // Resolve selector tại vị trí (x,y) tài liệu — robust hơn click point cố định
+      const posX = typeof x === "number" ? x : 0;
+      const posY = typeof y === "number" ? y : 0;
+      const reqId = requestId || "";
+      try {
+        // Cuộn để vị trí nằm trong viewport
+        window.scrollTo(posX - window.innerWidth / 2, posY - window.innerHeight / 2);
+        await sleep(120);
+        const vpX = posX - window.scrollX;
+        const vpY = posY - window.scrollY;
+        const target = document.elementFromPoint(vpX, vpY);
+        if (!target) {
+          ipcRenderer.send("web:result", { type: "possel", requestId: reqId, ok: false, reason: "no element at doc(" + posX + "," + posY + ")" });
+          return;
+        }
+        const tag = (target.tagName || "div").toLowerCase();
+        let selectorPicked = "";
+        if ((tag === "input" || tag === "textarea") && target.placeholder) {
+          const ph = String(target.placeholder);
+          selectorPicked = ph.includes('"') && !ph.includes("'") ? tag + "[placeholder='" + ph + "']" : tag + '[placeholder="' + ph + '"]';
+        } else if (target.id) {
+          selectorPicked = tag + "#" + target.id;
+        } else if (target.className && typeof target.className === "string") {
+          const safeClasses = target.className.split(/\s+/).filter(c => c && !c.includes(":")).slice(0, 2);
+          const classPart = safeClasses.map(c => "." + c.replace(/[^a-zA-Z0-9_-]/g, "")).join("");
+          selectorPicked = classPart ? tag + classPart : tag;
+        } else {
+          selectorPicked = tag;
+        }
+        let labelText = "";
+        try {
+          if (target.id) { const fl = document.querySelector('label[for="' + target.id + '"]'); if (fl) labelText = (fl.innerText || "").trim(); }
+          if (!labelText && typeof target.closest === "function") { const pl = target.closest("label"); if (pl) labelText = (pl.innerText || "").trim(); }
+        } catch (_) {}
+        let elText = "";
+        try { elText = (target.innerText || target.textContent || "").trim().slice(0, 200); } catch (_) {}
+        let containerTagR = "", containerClassNameR = "";
+        try {
+          const container = (typeof target.closest === "function" && target.closest("div,section,article,li,td,th")) || target.parentElement;
+          if (container) {
+            containerTagR = (container.tagName || "").toLowerCase();
+            if (container.className && typeof container.className === "string") {
+              containerClassNameR = container.className.split(/\s+/).filter(c => c && !c.includes(":")).slice(0, 2).join(" ");
+            }
+          }
+        } catch (_) {}
+        ipcRenderer.send("web:result", {
+          type: "possel", requestId: reqId, ok: true,
+          selector: selectorPicked, elementText: elText, labelText, containerTag: containerTagR, containerClassName: containerClassNameR
+        });
+      } catch (e) {
+        ipcRenderer.send("web:result", { type: "possel", requestId: reqId, ok: false, reason: e && e.message ? e.message : "possel error" });
+      }
+      return;
+    }
+
     sendStatus("Unhandled web:exec type = " + type);
   } catch (err) {
     console.warn("[WEB] command error:", type, err);
